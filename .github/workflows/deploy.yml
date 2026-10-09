@@ -46,9 +46,11 @@ jobs:
         run: python -u tools/topbuilds.py
         continue-on-error: true
 
+      # Reddit often rate-limits GitHub's servers; never let it hold up publishing the site.
       - name: Refresh community balance talk
         run: python -u tools/community.py --max-age-hours 6
         continue-on-error: true
+        timeout-minutes: 4
 
       - name: Save data caches
         if: always()
