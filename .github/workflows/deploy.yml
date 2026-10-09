@@ -1,0 +1,82 @@
+# Keeps the public site current without a computer running: every 30 minutes this refreshes the
+# match sample, the top players' meta builds and (every 6 hours) community balance talk, then
+# publishes the site to GitHub Pages. The bulky caches carry over between runs in the Actions
+# cache instead of the repository.
+name: Update data and deploy
+
+on:
+  schedule:
+    - cron: "17,47 * * * *"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore data caches
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: data-${{ github.run_id }}
+          restore-keys: data-
+
+      - name: Refresh match sample
+        run: python -u tools/matches.py
+        continue-on-error: true
+
+      - name: Refresh top players' meta builds
+        run: python -u tools/topbuilds.py
+        continue-on-error: true
+
+      - name: Refresh community balance talk
+        run: python -u tools/community.py --max-age-hours 6
+        continue-on-error: true
+
+      - name: Save data caches
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: data-${{ github.run_id }}
+
+      - name: Assemble the site
+        run: |
+          mkdir -p _site/data
+          cp index.html _site/
+          cp -r assets _site/
+          for f in matches.json top_builds.json community.json; do
+            if [ -f "data/$f" ]; then cp "data/$f" _site/data/; fi
+          done
+          touch _site/.nojekyll
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

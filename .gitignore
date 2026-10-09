@@ -1,0 +1,12 @@
+# Data the scheduled GitHub Action (or tools/serve.py locally) regenerates.
+data/
+
+# Deadlock's fonts are licensed to Valve, so they stay local; the site falls back to Jost online.
+assets/game/fonts/
+
+# Local-only files.
+__pycache__/
+*.pyc
+.claude/
+assets/game.new/
+assets/game.old/
