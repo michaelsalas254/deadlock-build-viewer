@@ -383,7 +383,15 @@
   .tier-info:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
   .tier-count { margin-left: auto; font-size: 13px; font-weight: 600; opacity: .85; }
   .tier-body { display: flex; flex-wrap: wrap; gap: 12px 8px; padding: 14px; min-height: 60px; }
-  .tier-hero { width: 86px; display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 0; border: 0; background: none; color: var(--text2); cursor: pointer; }
+  .tier-hero { position: relative; width: 86px; display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 0; border: 0; background: none; color: var(--text2); cursor: pointer; }
+  /* Tier moves since the latest patch: green up, red down. */
+  .tier-move { position: absolute; top: -7px; right: -1px; z-index: 1; width: 24px; height: 24px; border-radius: 50%; box-shadow: 0 0 0 2px #10130D, 0 2px 6px #000a;
+    background: center / 14px 14px no-repeat url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 2v12M3 7l5-5 5 5' fill='none' stroke='white' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); }
+  .tier-move.up { background-color: #1fb052; }
+  .tier-move.down { background-color: #e0393e; transform: rotate(180deg); }
+  .tt-move { margin: 6px 0 0; font-weight: 600; font-size: 13px; }
+  .tt-move.up { color: #5fd38a; }
+  .tt-move.down { color: #ff7a7e; }
   .tier-hero img { width: 78px; height: 78px; border-radius: 6px; object-fit: cover; object-position: center 12%; background: color-mix(in srgb, var(--t1) 25%, #1d221a); box-shadow: 0 2px 6px #0009; transition: transform .12s ease; }
   .tier-hero:hover img, .tier-hero:focus-visible img { transform: translateY(-2px) scale(1.05); }
   .tier-hero:focus-visible { outline: none; }
@@ -1467,14 +1475,24 @@ const loadTiers = (rank = 'all') => once(`tiers:${rank}`, async () => {
 
   if (model) {
     const combined = combineWithFactors(model, z, ids);
+    // Placed the same way from the games before the latest patch, to show tier moves since.
+    const earlier = model.before ? combineWithFactors(model.before, z, ids) : null;
+    const tierIndex = t => TIERS.indexOf(t);
     const stats = new Map();
     for (const id of ids) {
       const c = combined.heroes.get(id);
       const placed = tierFromModel(c.strength, c.sd);
       const m = model.heroes.get(id);
+      const e = model.before?.heroes.has(id) ? earlier.heroes.get(id) : null;
+      const was = e && tierFromModel(e.strength, e.sd);
+      // A move counts only when the tier changed and the measured effect moved at least a point,
+      // so a hero sitting right on a tier line doesn't flicker between arrows.
+      const moved = was && was.tier !== placed.tier && Math.abs(placed.effect - was.effect) >= 0.01
+        ? { dir: tierIndex(placed.tier) < tierIndex(was.tier) ? 'up' : 'down', from: was.tier, fromEffect: was.effect, patch: model.before.patch }
+        : null;
       stats.set(id, {
         ...info.get(id), duel: duels.stats.get(id) ?? null,
-        score: c.strength, sd: c.sd, prior: c.prior, dataShare: c.dataShare, ...placed,
+        score: c.strength, sd: c.sd, prior: c.prior, dataShare: c.dataShare, ...placed, moved,
         games: m?.games ?? 0, measured: m?.strength ?? null, measuredSe: m?.se ?? null,
         factors: Object.fromEntries(PRIOR_FACTORS.map(k => [k, z[k]?.get(id) ?? null])),
       });
@@ -1729,7 +1747,20 @@ async function fitHeroModel(rank, progress) {
   const effective = new Float64Array(d.heroIds.length);
   for (let i = 0; i < d.n; i++) for (let k = 0; k < 12; k++) effective[d.heroes[i * 12 + k]] += w[i];
   const heroes = new Map(d.heroIds.map((id, j) => [id, { strength: final.beta[j], se: final.se[j], games: effective[j] }]));
-  return { heroes, side: final.beta[d.heroIds.length], best, tried, matches: d.n, test: best, rank };
+
+  // The same model as it stood just before the latest patch (only games played before it), so the
+  // tier list can show who moved up or down since.
+  const { patch } = await loadDataWindow();
+  let before = null;
+  if (patch && d.time.some(t => t < patch.time)) {
+    const w = matchWeights(d, patch.time, best.halfLife, best.patchWeight, patchTimes);
+    const fit = fitStrengths(d, w, final.beta);
+    // Heroes need real games before the patch (a hero released after it has nothing to compare).
+    const gamesBefore = new Float64Array(d.heroIds.length);
+    for (let i = 0; i < d.n; i++) if (d.time[i] < patch.time) for (let k = 0; k < 12; k++) gamesBefore[d.heroes[i * 12 + k]] += d.base[i];
+    before = { patch, heroes: new Map(d.heroIds.map((id, j) => [id, { strength: fit.beta[j], se: fit.se[j] }]).filter((_, j) => gamesBefore[j] >= 300)) };
+  }
+  return { heroes, before, side: final.beta[d.heroIds.length], best, tried, matches: d.n, test: best, rank };
 }
 
 // Combines the match-based strength with what the other factors predict (an empirical-Bayes prior):
@@ -1891,11 +1922,19 @@ function tierHero(r) {
   const label = r.effect != null
     ? { text: `${signedPct(r.effect)} win`, title: 'How much this hero adds to their team’s chance of winning' }
     : wr != null && { text: `${pct1(wr)} WR`, title: `Real win rate ${r.wrHigh != null ? 'at Phantom+ ' : ''}since the patch` };
-  return el('button', { type: 'button', class: 'tier-hero', 'data-tip': `hero:${r.hero.id}`, 'aria-label': `${r.hero.name}, ${r.tier.key} tier${label ? `, ${label.text}` : ''}`,
+  const move = r.moved && moveText(r);
+  return el('button', { type: 'button', class: 'tier-hero', 'data-tip': `hero:${r.hero.id}`, 'aria-label': `${r.hero.name}, ${r.tier.key} tier${label ? `, ${label.text}` : ''}${move ? `. ${move}` : ''}`,
     onclick: () => openHeroBuild(r.hero.id) },
     gameImg([images.icon_hero_card_webp, images.icon_hero_card], { alt: '', loading: 'lazy' }),
+    r.moved && el('span', { class: `tier-move ${r.moved.dir}`, title: move, 'aria-hidden': 'true' }),
     el('span', { class: 'tier-name', text: r.hero.name }),
     label && el('span', { class: 'tier-wr', title: label.title, text: label.text }));
+}
+
+// "Up from A tier before the Minor Update - 10-05-2026 patch (+1.2% → +3.4%)".
+function moveText(r) {
+  const m = r.moved;
+  return `${m.dir === 'up' ? 'Up' : 'Down'} from ${m.from.key} tier before the ${m.patch.title} patch (${signedPct(m.fromEffect)} → ${signedPct(r.effect)} to their team’s win chance)`;
 }
 
 // Opens the hero's meta build: the top players' build when there is one, otherwise the recommended
@@ -1927,6 +1966,7 @@ function heroTip(id) {
     return el('div', {}, head,
       el('div', { class: 'tt-sec' },
         el('div', { class: 'tt-stats big' }, statRow({ value: signedPct(r.effect), label: 'to their team’s chance of winning' })),
+        r.moved && el('p', { class: `tt-move ${r.moved.dir}`, text: `${r.moved.dir === 'up' ? '▲' : '▼'} ${moveText(r)}` }),
         el('div', { class: 'tt-stats' },
           statRow({ value: `±${(margin * 100).toFixed(1)}%`, label: 'margin of error (95%)' }),
           statRow({ value: pct(r.confidence), label: `sure they belong in ${r.tier.key}` }),
