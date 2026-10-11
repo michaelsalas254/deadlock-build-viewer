@@ -10,6 +10,7 @@ Keeps the item purchases of recent Ascendant+ matches in data/top_purchases.json
 Usage (normally run by serve.py):
     python tools/topbuilds.py
 """
+import bisect
 import calendar
 import json
 import os
@@ -284,7 +285,75 @@ def build_for_hero(games, items, enemies):
         "avoid": dropped[:6], "matchups": matchup_counters(chosen, items, enemies, base),
         # Measured win-rate impact of every item with enough data, for judging saved builds.
         "impacts": {str(s["id"]): s["impact"] for s in stats.values() if "impact" in s},
+        # How often this hero's top players buy each item at all (for the counter-pick page).
+        "rates": {str(s["id"]): round(s["rate"], 3) for s in stats.values() if s["rate"] >= 0.03},
     }
+
+
+def counter_stats(games, enemies, min_games=150):
+    """Measured counter value of items against each enemy hero.
+
+    For an item and an enemy hero: how much more buyers out-win non-buyers when that hero is on the
+    other team than when they aren't. Subtracting the "enemy absent" gap removes how good the item
+    is in general, leaving what is specific to the matchup. Only clear effects are kept (at least
+    1.5 margins of error); the page uses them as supporting evidence, not as its only source.
+    """
+    times = defaultdict(list)
+    for g in games:
+        for iid, t, _s in g[5]:
+            times[iid].append(t)
+    median = {iid: statistics.median(ts) for iid, ts in times.items() if len(ts) >= 200}
+    ends_all = [[], []]
+    ends_vs = defaultdict(lambda: [[], []])
+    with_all = defaultdict(lambda: [0, 0])
+    with_vs = defaultdict(lambda: [0, 0])
+    for g in games:
+        end, won = max(t for _i, t, _s in g[5]), g[4]
+        foes = enemies.get((g[0], g[3]), ())
+        ends_all[won].append(end)
+        for e in foes:
+            ends_vs[e][won].append(end)
+        for iid in g[6]:
+            m = median.get(iid)
+            if m is None or end < m:
+                continue
+            w = with_all[iid]
+            w[0] += 1
+            w[1] += won
+            for e in foes:
+                w = with_vs[(e, iid)]
+                w[0] += 1
+                w[1] += won
+    for pools in [ends_all, *ends_vs.values()]:
+        for lst in pools:
+            lst.sort()
+
+    def pool(ends, m):
+        losses = len(ends[0]) - bisect.bisect_left(ends[0], m)
+        wins = len(ends[1]) - bisect.bisect_left(ends[1], m)
+        return losses + wins, wins
+
+    overall, lifts = {}, defaultdict(dict)
+    for iid, m in median.items():
+        total_n, total_w = pool(ends_all, m)
+        have_n, have_w = with_all[iid]
+        if have_n >= min_games and total_n - have_n >= min_games:
+            overall[str(iid)] = {"rate": round(have_n / total_n, 3),
+                                 "impact": round(have_w / have_n - (total_w - have_w) / (total_n - have_n), 4)}
+        for e, pools in ends_vs.items():
+            vs_n, vs_w = pool(pools, m)
+            a = with_vs.get((e, iid), (0, 0))                    # enemy present, item bought
+            b = (vs_n - a[0], vs_w - a[1])                       # enemy present, not bought
+            c = (have_n - a[0], have_w - a[1])                   # enemy absent, bought
+            d = ((total_n - vs_n) - c[0], (total_w - vs_w) - c[1])  # enemy absent, not bought
+            if min(a[0], b[0], c[0], d[0]) < min_games:
+                continue
+            r = [x[1] / x[0] for x in (a, b, c, d)]
+            se = sum(p * (1 - p) / x[0] for p, x in zip(r, (a, b, c, d))) ** 0.5
+            lift = (r[0] - r[1]) - (r[2] - r[3])
+            if lift >= 0.02 and lift >= 1.5 * se:
+                lifts[str(e)][str(iid)] = round(lift, 4)
+    return {"items": overall, "lifts": lifts}
 
 
 def refresh(root, log=print):
@@ -308,8 +377,9 @@ def refresh(root, log=print):
         b = build_for_hero(games, items, enemies)
         if b:
             heroes[str(hero_id)] = b
+    recent = [g for games in by_hero.values() for g in games]
     out = {"updated": now, "minBadge": TOP_BADGE, "days": KEEP_DAYS, "sincePatch": since or None,
-           "games": sum(len(v) for v in by_hero.values()), "heroes": heroes}
+           "games": len(recent), "heroes": heroes, "counters": counter_stats(recent, enemies)}
     path = os.path.join(root, "data", "top_builds.json")
     with open(path + ".tmp", "w", encoding="utf-8") as f:
         json.dump(out, f, separators=(",", ":"))

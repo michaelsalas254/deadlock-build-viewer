@@ -1,8 +1,8 @@
 # Deadlock Build Viewer
 
 A fan site for Deadlock: view any build by its ID in an in-game–style shop layout, meta builds learned
-from what top players actually buy, a tier list measured from real matches, duel matchups, and a
-recommended hero roster.
+from what top players actually buy, a tier list measured from real matches, duel matchups, a
+recommended hero roster, and counter picks (choose the enemy team, see what to buy against it).
 
 Fan-made and not affiliated with Valve. Hero, item and build data come from
 [deadlock-api.com](https://deadlock-api.com).

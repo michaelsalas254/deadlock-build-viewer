@@ -504,6 +504,22 @@
     .roster-plan { grid-template-columns: minmax(0, 1fr); }
   }
 
+  /* ---------- counter picks ---------- */
+  .cp-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(76px, 1fr)); gap: 8px; margin-bottom: 16px; }
+  .cp-hero { display: flex; flex-direction: column; align-items: center; gap: 3px; padding: 4px 2px; border: 2px solid transparent; border-radius: 6px; background: #10130D99; color: var(--text2); font: 600 12px/1.2 var(--sans); cursor: pointer; }
+  .cp-hero img { width: 60px; height: 60px; border-radius: 5px; object-fit: cover; object-position: center 12%; filter: saturate(.55) brightness(.75); transition: filter .1s ease; }
+  .cp-hero:hover img, .cp-hero[aria-pressed="true"] img { filter: none; }
+  .cp-hero[aria-pressed="true"] { border-color: #e0393e; background: #3a1214; color: var(--off-white); }
+  .cp-hero:focus-visible { outline: 2px solid var(--mods-gold); outline-offset: 1px; }
+  .cp-hero span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cp-threats { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; }
+  .cp-cards { gap: 10px 14px; align-items: flex-start; }
+  .cp-item { display: flex; flex-direction: column; align-items: center; gap: 3px; width: 112px; text-align: center; }
+  .cp-stat { color: var(--off-white); font-weight: 700; font-size: 12.5px; line-height: 1.2; }
+  .cp-note { color: #FFEFD7a8; font-size: 11.5px; line-height: 1.25; }
+  .cp-note.good { color: #9bd46a; font-weight: 600; cursor: help; }
+  .cp-empty { margin: 8px 0; padding: 18px; border-radius: 4px; background: #10130D99; color: var(--text2); font-weight: 600; text-align: center; }
+
   /* ---------- tooltip ---------- */
   #tooltip {
     position: fixed; z-index: 50; top: 0; left: 0;
@@ -567,6 +583,7 @@
   <nav class="topnav" aria-label="Pages">
     <a href="?" id="navHome">Meta Builds</a>
     <a href="?view=roster" id="navRoster">Best Roster</a>
+    <a href="?view=counter" id="navCounter">Counter Picks</a>
   </nav>
   <form class="lookup" id="lookup" autocomplete="off">
     <input id="buildId" name="id" inputmode="numeric" placeholder="Enter a build ID, e.g. 439842" aria-label="Build ID">
@@ -578,6 +595,7 @@
   <div id="status" class="status" role="status" aria-live="polite"></div>
   <section id="home" hidden></section>
   <section id="roster" hidden></section>
+  <section id="counter" hidden></section>
   <article id="build" class="shop" data-filter="all" hidden></article>
   <footer>
     <p id="assetNote"></p>
@@ -1393,7 +1411,7 @@ const abilitySentences = a => (a.description?.desc ?? '')
 
 // Crowd control and utility in a hero's four abilities, weighted per second of cooldown.
 function kitScores(hero) {
-  let cc = 0, utility = 0;
+  let cc = 0, utility = 0, heals = 0, mobility = 0;
   for (const slot of ['signature1', 'signature2', 'signature3', 'signature4']) {
     const a = state.assets.byClass.get(hero.items?.[slot]);
     if (!a) continue;
@@ -1430,10 +1448,17 @@ function kitScores(hero) {
       has(/barrier/i),
       has(/invis|stealth/i),
       has(/^(Dash|Teleport|Grapple|Fly|Flight)|^(BonusMoveSpeed|MoveSpeedBonus|MovementSpeedBonus|BonusSprintSpeed|SprintSpeedBonus|BonusMoveSpeedPercent|MoveSpeedBonusPct)$/i),
-    ].filter(Boolean).length;
-    utility += (10 * kinds) / cooldown;
+    ];
+    utility += (10 * kinds.filter(Boolean).length) / cooldown;
+    // For the counter page: abilities that really heal ("Heal", not "Health"), ones that put the hero
+    // in the air (a full point), and dashes or short hops (half a point).
+    const healKey = k => /Heal(?!th)|Life[Ss]teal|LifeDrain|HealthSteal|HealthRegen/.test(k) && !/Penalty|Reduction|^HealAmp|Disable|Radius|Interval|Duration|NonHero|Turret/.test(k);
+    const selfSays = re => abilitySentences(a).some(s => re.test(s));
+    heals += keys.some(healKey) || selfSays(/\b(swaps?|steals?|drains?)\b[^.]*\bhealth\b/i) ? 1 : 0;
+    mobility += has(/^(MaxFlyHeight|FlyingItemCastRange|FlightControlEnabled|UpBoostSpeed|JumpVelocity|JumpSpeed)$/) || selfSays(/\b(take\s+flight|and\s+fly\b|glide|to\s+float)/i) ? 1
+      : has(/^(DashSpeed|ChargeSpeedMax|AirSpeedMax|JumpForce|TeleportCompletedTime|\w*JumpVelocity\w*)$/) ? 0.5 : 0;
   }
-  return { cc, utility };
+  return { cc, utility, heals, mobility };
 }
 
 // z-scores (how many standard deviations from the average hero), capped so one outlier can't dominate.
@@ -2254,6 +2279,291 @@ function renderRoster(plan, entries, all) {
         ? `${total} heroes, from the tier list’s strength model (${fmtNum(all.model.matches)} recent matches). Because your rank isn’t known, each hero counts at the average of their all-ranks and Phantom+ strength. `
         : [`${total} heroes, from the approximate tier list: the local match sample isn’t available, so the strength model couldn’t run. `, localDataHint(), ' '],
       'Locked heroes are skipped, and the roster always keeps at least 3 non-NEW heroes so it can queue. It updates on its own as the meta shifts. Hover a hero for their numbers; click one to open their build.'));
+}
+
+/* ---------- counter picks ---------- */
+
+// Pick the enemy team and see what to buy against it. What each enemy does comes from their abilities
+// and top players' builds (gun or spirit damage, healing, crowd control, mobility, tankiness, melee);
+// which items answer each threat comes from the items' own stats. Inside each answer, items are
+// ranked by strength, by how often top players of your hero buy them, and by their measured
+// win-rate effect against those enemies where that is statistically clear.
+const propOf = (item, key) => Math.abs(num(item.properties?.[key]?.value));
+// What the item's own description says (some effects, like "immune to bullets", aren't numbers).
+const itemSays = (item, re) => re.test(`${item.description?.desc ?? ''} ${(item.tooltip_sections ?? []).flatMap(s => s.section_attributes ?? []).map(a => a.loc_string ?? '').join(' ')}`
+  .replace(/<svg[\s\S]*?<\/svg>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' '));
+const bulletImmune = i => itemSays(i, /immune to bullets/i);
+const disarms = i => itemSays(i, /\bdisarms? (the )?(enemy|target)/i);
+const ccImmune = i => itemSays(i, /immune to stun/i);
+const purges = i => itemSays(i, /\bpurge/i);
+const grounds = i => itemSays(i, /gravity|airborne/i);
+// How central a stat is to an item, from where its tooltip puts it: a headline stat counts in full,
+// one that only applies while the item's active is running 30%, a small side stat 40%. This keeps
+// items that merely carry a little resist (and are popular for other reasons) out of the answers.
+const TEMPORARY = 0.3;
+function propWeight(item, key) {
+  for (const s of item.tooltip_sections ?? []) {
+    for (const a of s.section_attributes ?? []) {
+      const headline = a.elevated_properties?.includes(key) || a.important_properties?.includes(key);
+      if (!headline && !a.properties?.includes(key)) continue;
+      if (s.section_type === 'active') return TEMPORARY;
+      return headline || s.section_type === 'passive' ? 1 : 0.4;
+    }
+  }
+  return 0.4;
+}
+const mainProp = (item, keys) => keys.reduce((a, b) => (propOf(item, b) * propWeight(item, b) > propOf(item, a) * propWeight(item, a) ? b : a));
+const weighted = (item, keys) => { const k = mainProp(item, keys); return propOf(item, k) * propWeight(item, k); };
+const resistText = (item, keys, label) => { const k = mainProp(item, keys); return `${propOf(item, k)}% ${label}${propWeight(item, k) === TEMPORARY ? ' while active' : ''}`; };
+// Each kind of answer. `slot` keeps defensive answers to vitality items.
+const COUNTER_TYPES = [
+  { key: 'antiheal', trait: 'healing', title: 'Cut their healing', does: ['heals a lot', 'heal a lot'],
+    strength: i => (i.properties?.DeathImmunityDuration ? 0 : propOf(i, 'HealAmpReceivePenaltyPercent')),
+    stat: i => `−${propOf(i, 'HealAmpReceivePenaltyPercent')}% healing` },
+  { key: 'bullet', trait: 'gun', slot: 'vitality', title: 'Resist their guns', does: ['deals gun damage', 'deal gun damage'],
+    strength: i => { const r = weighted(i, ['BulletResist', 'BuffBulletResist']); return (r >= 15 ? r : 0) + (bulletImmune(i) ? 40 : 0) + propOf(i, 'BulletDamageReflectedPct') / 3; },
+    stat: i => (bulletImmune(i) ? 'brief bullet immunity' : propOf(i, 'BulletDamageReflectedPct') ? `fires back ${propOf(i, 'BulletDamageReflectedPct')}% of bullet damage`
+      : resistText(i, ['BulletResist', 'BuffBulletResist'], 'bullet resist')) },
+  { key: 'fireslow', trait: 'gun', title: 'Shut down their shooting', does: ['relies on shooting', 'rely on shooting'],
+    strength: i => propOf(i, 'FireRateSlow') + (disarms(i) ? 40 : 0),
+    stat: i => (disarms(i) ? 'disarms the target' : `−${propOf(i, 'FireRateSlow')}% fire rate`) },
+  { key: 'spirit', trait: 'spirit', slot: 'vitality', title: 'Resist their spirit damage', does: ['deals spirit damage', 'deal spirit damage'],
+    strength: i => { const r = Math.max(weighted(i, ['TechResist', 'BuffTechResist']), propOf(i, 'SpiritDamageReductionProc') / 2); return r >= 15 ? r : 0; },
+    stat: i => (propOf(i, 'SpiritDamageReductionProc') ? `blocks ${propOf(i, 'SpiritDamageReductionProc')}% of a big spirit hit` : resistText(i, ['TechResist', 'BuffTechResist'], 'spirit resist')) },
+  { key: 'silence', trait: 'spirit', title: 'Shut down their abilities', does: ['relies on abilities', 'rely on abilities'],
+    strength: i => propOf(i, 'SilenceDuration') * 12 + propOf(i, 'TechPowerReduction'),
+    stat: i => (propOf(i, 'SilenceDuration') ? `${propOf(i, 'SilenceDuration')}s silence` : `−${propOf(i, 'TechPowerReduction')}% spirit power`) },
+  { key: 'cc', trait: 'cc', slot: 'vitality', title: 'Shrug off crowd control', does: ['has a lot of crowd control', 'have a lot of crowd control'],
+    strength: i => { const r = weighted(i, ['StatusResistancePercent']); return (r >= 20 ? r : 0) + propOf(i, 'StatusImmuneDuration') * 8 + (propOf(i, 'VexBarrierCombatBarrier') ? 20 : 0) + (ccImmune(i) ? 35 : 0) + (purges(i) ? 30 : 0); },
+    stat: i => (ccImmune(i) ? 'immune to stuns for a moment' : purges(i) ? 'removes debuffs'
+      : propOf(i, 'StatusImmuneDuration') ? `${propOf(i, 'StatusImmuneDuration')}s immunity`
+      : propOf(i, 'StatusResistancePercent') >= 20 ? `${propOf(i, 'StatusResistancePercent')}% debuff resist` : 'barrier when stunned') },
+  // Active items you aim at one enemy to stun or slow them; ones that also pull fliers down count extra.
+  { key: 'pin', trait: 'mobile', title: 'Ground fliers and escape artists', does: ['flies or dashes away', 'fly or dash away'],
+    strength: i => {
+      if (!i.is_active_item || !itemSays(i, /slow|stun|gravity/i)) return 0;
+      const stun = propOf(i, 'StunDelay') && propOf(i, 'StunDuration') ? 50 : 0;
+      const slow = Math.max(propOf(i, 'SlowPercent'), propOf(i, 'MovementSpeedSlow')) * 0.5;
+      return stun || slow ? stun + slow + (grounds(i) ? 30 : 0) : 0;
+    },
+    stat: i => (propOf(i, 'StunDelay') && propOf(i, 'StunDuration') ? `stuns${grounds(i) ? ', longer on airborne targets' : ''}`
+      : `${Math.max(propOf(i, 'SlowPercent'), propOf(i, 'MovementSpeedSlow'))}% slow${grounds(i) ? ', pulls fliers down' : ''}`) },
+  // Damage that scales with the target's health, so stacking health doesn't help them.
+  { key: 'tank', trait: 'tanky', title: 'Melt their tanks', does: ['builds very tanky', 'build very tanky'],
+    strength: i => propOf(i, 'CurrentHealthDamage') * 3 + propOf(i, 'DotHealthPercent') * 10 + propOf(i, 'MaxHealthDamage') * 2 + propOf(i, 'MaxHealthPercentAsDPS') * 8,
+    stat: i => (propOf(i, 'CurrentHealthDamage') ? `${propOf(i, 'CurrentHealthDamage')}% current health per hit`
+      : propOf(i, 'DotHealthPercent') || propOf(i, 'MaxHealthPercentAsDPS') ? `${propOf(i, 'DotHealthPercent') || propOf(i, 'MaxHealthPercentAsDPS')}% max health per second`
+      : `${propOf(i, 'MaxHealthDamage')}% max health damage`) },
+  { key: 'melee', trait: 'melee', title: 'Stop their melee', does: ['fights in melee', 'fight in melee'],
+    strength: i => propOf(i, 'MeleeResistPercent') + (propOf(i, 'ParryCooldownReduction') ? 15 : 0),
+    stat: i => (propOf(i, 'MeleeResistPercent') ? `${propOf(i, 'MeleeResistPercent')}% melee resist` : 'stronger parry') },
+];
+const TRAIT_LABELS = { gun: 'Gun damage', spirit: 'Spirit damage', healing: 'Healing', cc: 'Crowd control', mobile: 'Mobility', tanky: 'Tanky', melee: 'Melee' };
+const LIFESTEAL_PROPS = ['BulletLifestealPercent', 'AbilityLifestealPercentHero', 'LifestealHealPercent', 'LifestrikeHeal', 'BonusSpiritLifesteal'];
+const MELEE_PROPS = ['BonusHeavyMeleeDamage', 'LifestrikeHeal', 'LifestealHeal'];
+const MAX_ENEMIES = 6;
+const CP = { enemies: [], me: null };
+
+// How much each hero does each threatening thing, 0 to 1 (below 0.5 doesn't count as a threat).
+function heroTraits(hero, kit, ccZ, tb, assets) {
+  const core = tb ? topCore(tb).map(s => assets.byId.get(s.id)).filter(Boolean) : [];
+  const split = soulSplit(core);
+  const having = props => core.filter(i => props.some(k => propOf(i, k))).length;
+  // Healing: two healing abilities, or one plus a couple of lifesteal items in the core build.
+  const healing = kit.heals + 0.34 * having(LIFESTEAL_PROPS);
+  // Tanky: half the core build's souls in vitality, or nearly that on a hero with a big health pool.
+  const vitality = split?.vitality ?? 0;
+  const tanky = vitality >= 0.5 || (vitality >= 0.42 && num(hero.starting_stats?.max_health?.value) >= 800);
+  // Melee: a core build with an outright melee item (heavy melee, melee lifesteal) or stacked melee damage.
+  const meleeBonus = core.reduce((s, i) => s + propOf(i, 'BonusMeleeDamagePercent'), 0);
+  const melee = meleeBonus >= 25 || having(MELEE_PROPS) > 0;
+  return {
+    gun: tb?.style === 'gun' ? 1 : tb?.style === 'spirit' ? 0 : 0.5,
+    spirit: tb?.style === 'spirit' ? 1 : tb?.style === 'gun' ? 0 : 0.5,
+    healing: healing >= 1.5 ? Math.min(1, healing / 2.5) : 0,
+    cc: ccZ >= 0.4 ? Math.min(1, 0.5 + ccZ / 4) : 0,
+    mobile: kit.mobility >= 1 ? Math.min(1, 0.5 + kit.mobility / 4) : 0,
+    tanky: tanky ? Math.min(1, 0.5 + vitality) : 0,
+    melee: melee ? 0.75 : 0,
+  };
+}
+
+// Hero threats and the items that answer each kind (with a 0–1 strength and a short stat line).
+// Needs the full game data, so the snapshot carries the result for an instant page.
+const loadCounterData = () => once('counterData', async () => {
+  const [heroes, assets, tops] = await Promise.all([loadHeroList(), loadAssets(), loadTopBuilds()]);
+  state.assets = assets;
+  const kits = new Map(heroes.map(h => [h.id, kitScores(h)]));
+  const ccZ = zScores(new Map([...kits].map(([id, k]) => [id, k.cc])));
+  // Items top players never buy are left out: they're event or retired items still in the game files.
+  const bought = tops?.counters?.items;
+  const shop = [...assets.byId.values()].filter(i => i.type === 'upgrade' && i.shopable && (!bought || bought[i.id]?.rate >= 0.002));
+  return {
+    traits: Object.fromEntries(heroes.map(h => [h.id, heroTraits(h, kits.get(h.id), ccZ.get(h.id) ?? 0, tops?.heroes?.[h.id], assets)])),
+    types: Object.fromEntries(COUNTER_TYPES.map(t => {
+      const scored = shop.filter(i => !t.slot || i.item_slot_type === t.slot)
+        .map(i => ({ id: i.id, strength: t.strength(i), stat: t.stat(i) })).filter(s => s.strength > 0);
+      const max = Math.max(1, ...scored.map(s => s.strength));
+      return [t.key, scored.map(s => ({ ...s, strength: +(s.strength / max).toFixed(3) }))];
+    })),
+  };
+});
+
+// For the chosen enemies: each kind of threat they pose (biggest first) with its best answers.
+function counterPlan(enemyIds, myId, data, tops) {
+  const lifts = tops?.counters?.lifts ?? {}, overall = tops?.counters?.items ?? {};
+  const mine = myId ? tops?.heroes?.[myId] : null;
+  const sections = [];
+  for (const type of COUNTER_TYPES) {
+    const foes = enemyIds.map(id => ({ id, strength: data.traits[id]?.[type.trait] ?? 0 })).filter(f => f.strength >= 0.5);
+    if (!foes.length) continue;
+    const items = (data.types[type.key] ?? []).map(it => {
+      const measured = foes.map(f => ({ id: f.id, lift: lifts[f.id]?.[it.id] })).filter(m => m.lift);
+      const rate = mine ? mine.rates?.[it.id] ?? 0 : null;
+      // What top players actually buy counts a lot, so a staple outranks a niche item with a bigger
+      // number; capped so an item your hero always buys anyway doesn't swamp everything else.
+      const popularity = Math.min(0.25, rate ?? overall[it.id]?.rate ?? 0);
+      return { ...it, measured, rate, score: 0.6 * it.strength + 3 * popularity + 5 * measured.reduce((s, m) => s + m.lift, 0) };
+    }).sort((a, b) => b.score - a.score);
+    // Up to five, and nothing far behind the best answer.
+    const best = items.filter(it => it.score >= 0.4 * items[0].score).slice(0, 5);
+    if (best.length) sections.push({ type, foes, threat: foes.reduce((s, f) => s + f.strength, 0), items: best });
+  }
+  return sections.sort((a, b) => b.threat - a.threat);
+}
+
+// The short list: the best answer to each of the biggest threats (one per kind of threat, no repeats).
+function counterFirstBuys(sections, limit = 4) {
+  const picks = [];
+  for (const s of sections) {
+    if (picks.some(p => p.section.type.trait === s.type.trait)) continue;
+    const it = s.items.find(x => !picks.some(p => p.item.id === x.id));
+    if (it) picks.push({ item: it, section: s });
+    if (picks.length >= limit) break;
+  }
+  return picks;
+}
+
+function syncCounterUrl() {
+  const url = new URL(location.href);
+  url.search = '?view=counter' + (CP.enemies.length ? `&enemies=${CP.enemies.join(',')}` : '') + (CP.me ? `&me=${CP.me}` : '');
+  history.replaceState(null, '', url);
+}
+
+async function showCounter() {
+  const seq = ++requestSeq;
+  hideTip();
+  hideStatus();
+  for (const id of ['home', 'build', 'roster']) $(`#${id}`).hidden = true;
+  $('#buildId').value = '';
+  $('#backdrop').style.backgroundImage = '';
+  document.title = 'Counter Picks · Deadlock';
+  const params = new URLSearchParams(location.search);
+  CP.enemies = (params.get('enemies') ?? '').split(',').map(Number).filter(Boolean).slice(0, MAX_ENEMIES);
+  CP.me = Number(params.get('me')) || null;
+  const box = $('#counter');
+  box.hidden = false;
+  if (!box.firstChild) box.append(el('div', { class: 'shop-panel' }, el('p', { class: 'home-note', style: 'padding:18px', text: 'Loading heroes and items…' })));
+  try {
+    const [heroes, assets, data, tops] = await Promise.all([loadHeroesFast(), loadAssetsFast(), loadCounterData(), loadTopBuilds(), loadManifest()]);
+    if (seq !== requestSeq) return;
+    if (!state.assets?.full) state.assets = assets;
+    upgradeAssets();
+    CP.data = { heroes: [...heroes].sort((a, b) => a.name.replace(/^The /, '').localeCompare(b.name.replace(/^The /, ''))), data, tops };
+    box.replaceChildren(renderCounterShell());
+    renderCounterResult();
+  } catch (err) {
+    if (seq !== requestSeq) return;
+    box.replaceChildren(el('div', { class: 'shop-panel' }, el('p', { class: 'home-note', style: 'padding:18px' }, `Couldn’t load the counter data (${err.message}). `,
+      el('button', { class: 'pill', type: 'button', onclick: showCounter, text: 'Retry' }))));
+  }
+}
+
+function renderCounterShell() {
+  const { heroes } = CP.data;
+  return el('div', { class: 'shop-panel' },
+    el('header', { class: 'build-header' },
+      el('h1', { class: 'build-title', text: 'Counter Picks' }),
+      el('div', { class: 'hdr-btns' },
+        el('select', { class: 'pill', 'aria-label': 'Your hero', onchange: e => { CP.me = Number(e.target.value) || null; syncCounterUrl(); renderCounterResult(); } },
+          el('option', { value: '', text: 'Your hero (optional)' }),
+          heroes.map(h => el('option', { value: h.id, text: h.name, selected: CP.me === h.id }))),
+        el('button', { class: 'pill', type: 'button', text: 'Clear', onclick: () => { CP.enemies = []; syncCounterUrl(); updateCounterPicks(); renderCounterResult(); } }))),
+    el('div', { class: 'shop-body' },
+      el('div', { class: 'section-head' }, el('h2', { class: 'section-title', text: 'Enemy Team' }),
+        el('span', { class: 'home-note', id: 'cpCount', style: 'margin:0' })),
+      el('div', { class: 'cp-grid', id: 'cpGrid' }, heroes.map(h => {
+        const images = h.images ?? {};
+        return el('button', { type: 'button', class: 'cp-hero', 'data-hero': h.id, 'aria-pressed': String(CP.enemies.includes(h.id)), 'aria-label': h.name, onclick: () => toggleEnemy(h.id) },
+          gameImg([images.icon_hero_card_webp, images.icon_hero_card], { alt: '', loading: 'lazy' }),
+          el('span', { text: h.name }));
+      })),
+      el('div', { id: 'cpResult' })));
+}
+
+function toggleEnemy(id) {
+  if (CP.enemies.includes(id)) CP.enemies = CP.enemies.filter(x => x !== id);
+  else if (CP.enemies.length < MAX_ENEMIES) CP.enemies = [...CP.enemies, id];
+  else return;
+  syncCounterUrl();
+  updateCounterPicks();
+  renderCounterResult();
+}
+
+function updateCounterPicks() {
+  for (const b of document.querySelectorAll('#cpGrid .cp-hero')) b.setAttribute('aria-pressed', String(CP.enemies.includes(Number(b.dataset.hero))));
+}
+
+function renderCounterResult() {
+  const { heroes, data, tops } = CP.data;
+  const name = id => heroes.find(h => h.id === id)?.name ?? 'Unknown';
+  $('#cpCount').textContent = `${CP.enemies.length} of ${MAX_ENEMIES} picked. Click a hero to add or remove them.`;
+  const box = $('#cpResult');
+  if (!CP.enemies.length) {
+    box.replaceChildren(el('p', { class: 'cp-empty', text: 'Pick the heroes on the enemy team to see what to buy against them.' }));
+    return;
+  }
+  const me = CP.me ? name(CP.me) : null;
+  const sections = counterPlan(CP.enemies, CP.me, data, tops);
+  const threats = Object.keys(TRAIT_LABELS).map(trait => ({ trait, foes: CP.enemies.filter(id => (data.traits[id]?.[trait] ?? 0) >= 0.5) })).filter(t => t.foes.length);
+  const itemBlock = it => {
+    const item = state.assets.byId.get(it.id);
+    if (!item) return null;
+    return el('div', { class: 'cp-item' },
+      renderCard({ mod: { ability_id: it.id }, item }),
+      el('span', { class: 'cp-stat', text: it.stat }),
+      it.rate != null && it.rate >= 0.03 && el('span', { class: 'cp-note', text: `${pct(it.rate)} of top ${me} players buy it` }),
+      it.measured.map(m => el('span', { class: 'cp-note good', title: 'Measured in Ascendant+ games: how much more buyers out-win non-buyers when this hero is on the enemy team', text: `${signedPct(m.lift)} wins vs ${name(m.id)}` })));
+  };
+  const first = counterFirstBuys(sections);
+  const firstBlock = ({ item: it, section: s }) => {
+    const item = state.assets.byId.get(it.id);
+    if (!item) return null;
+    return el('div', { class: 'cp-item' },
+      renderCard({ mod: { ability_id: it.id }, item }),
+      el('span', { class: 'cp-stat', text: s.type.title }),
+      el('span', { class: 'cp-note', text: `vs ${listText(s.foes.map(f => name(f.id)))}` }));
+  };
+  box.replaceChildren(
+    el('div', { class: 'cp-threats' }, threats.map(t => el('span', { class: 'tag' }, el('b', { text: `${TRAIT_LABELS[t.trait]}: ` }), t.foes.map(name).join(', ')))),
+    sections.length
+      ? el('div', { class: 'categories' },
+        first.length > 1 && el('section', { class: 'category cp-first', style: 'width:100%' },
+          el('header', { class: 'cat-head' },
+            el('h3', { class: 'cat-name', text: 'Buy These First' }),
+            el('p', { class: 'cat-desc', text: 'The best answer to each of this team’s biggest threats' })),
+          el('div', { class: 'cards cp-cards' }, first.map(firstBlock))),
+        sections.map(s => el('section', { class: 'category', style: 'width:100%' },
+          el('header', { class: 'cat-head' },
+            el('h3', { class: 'cat-name', text: s.type.title }),
+            el('p', { class: 'cat-desc', text: `${listText(s.foes.map(f => name(f.id)))} ${s.type.does[s.foes.length === 1 ? 0 : 1]}` })),
+          el('div', { class: 'cards cp-cards' }, s.items.map(itemBlock)))))
+      : el('p', { class: 'cp-empty', text: 'No special counters needed for these heroes: build your normal items.' }),
+    el('p', { class: 'home-note', style: 'margin-top:12px' },
+      'Threats come from each hero’s abilities and what top players build on them; answers come from the items’ own stats, strongest and most-bought first. ',
+      me ? `Buy rates are for Ascendant+ ${me} players. ` : 'Pick your hero above to rank items by what top players of that hero actually buy. ',
+      'Green notes are measured win-rate effects from Ascendant+ games, shown only when statistically clear.'));
+  fitCardNames(box);
 }
 
 async function copyBuildId(e, id) {
@@ -3814,10 +4124,15 @@ function route() {
   const params = new URLSearchParams(location.search);
   const id = params.get('id');
   const top = params.get('top');
-  const view = id && /^\d+$/.test(id) ? 'build' : top && /^\d+$/.test(top) ? 'top' : params.get('view') === 'roster' ? 'roster' : 'home';
+  const page = params.get('view');
+  const view = id && /^\d+$/.test(id) ? 'build' : top && /^\d+$/.test(top) ? 'top' : page === 'roster' || page === 'counter' ? page : 'home';
   $('#navHome').toggleAttribute('aria-current', view === 'home');
   $('#navRoster').toggleAttribute('aria-current', view === 'roster');
-  if (view === 'build') {
+  $('#navCounter').toggleAttribute('aria-current', view === 'counter');
+  if (view !== 'counter') $('#counter').hidden = true;
+  if (view === 'counter') {
+    showCounter();
+  } else if (view === 'build') {
     $('#buildId').value = id;
     loadBuild(id);
   } else if (view === 'top') {
@@ -3830,7 +4145,7 @@ function route() {
 }
 
 // Page links navigate in place instead of reloading.
-for (const link of [$('#navHome'), $('#navRoster')]) {
+for (const link of [$('#navHome'), $('#navRoster'), $('#navCounter')]) {
   link.addEventListener('click', e => {
     if (e.ctrlKey || e.metaKey || e.shiftKey || e.button) return;
     e.preventDefault();
@@ -3882,8 +4197,8 @@ function unpackTiers(p) {
 
 // Called by tools/snapshot.mjs on a page opened with ?snapshot=1 (which computes everything fresh).
 window.buildSnapshot = async () => {
-  const [heroes, assets, patches, metaAll, metaHigh, tiersAll, tiersHigh, topBuilds, roster, manifest, steam] = await Promise.all([
-    loadHeroList(), loadAssets(), loadPatches(), loadMeta('all'), loadMeta('high'), loadTiers('all'), loadTiers('high'), loadTopBuilds(), loadRosterHeroes(),
+  const [heroes, assets, patches, metaAll, metaHigh, tiersAll, tiersHigh, topBuilds, roster, counters, manifest, steam] = await Promise.all([
+    loadHeroList(), loadAssets(), loadPatches(), loadMeta('all'), loadMeta('high'), loadTiers('all'), loadTiers('high'), loadTopBuilds(), loadRosterHeroes(), loadCounterData(),
     fetch(MANIFEST_URL, { cache: 'no-cache' }).then(r => (r.ok ? r.json() : null)).catch(() => null),
     getJSON(`${API}/assets/steam-info`).catch(() => null),
   ]);
@@ -3891,7 +4206,7 @@ window.buildSnapshot = async () => {
     version: SNAPSHOT_VERSION, built: Math.floor(Date.now() / 1000),
     heroes: heroes.map(slimHero),
     items: [...assets.byId.values()].filter(i => i.type === 'upgrade').map(slimItem),
-    patches, topBuilds, manifest, steam: steam && { client_version: steam.client_version },
+    patches, topBuilds, counters, manifest, steam: steam && { client_version: steam.client_version },
     meta: { all: packMeta(metaAll), high: packMeta(metaHigh) },
     tiers: { all: packTiers(tiersAll), high: packTiers(tiersHigh) },
     roster: roster.map(e => ({ hero: slimHero(e.hero), locked: e.locked, isNew: e.isNew })),
@@ -3908,6 +4223,7 @@ async function seedSnapshot(request = window.snapshotRequest) {
   memo.set('patches', ready(snap.patches));
   memo.set('rosterHeroes', ready(snap.roster));
   if (snap.topBuilds) memo.set('topBuilds', ready(snap.topBuilds));
+  if (snap.counters) memo.set('counterData', ready(snap.counters));
   for (const rank of ['all', 'high']) {
     if (snap.meta?.[rank]) memo.set(`metaFast:${rank}`, ready(unpackMeta(snap.meta[rank])));
     if (snap.tiers?.[rank]) memo.set(`tiers:${rank}`, ready(unpackTiers(snap.tiers[rank])));
