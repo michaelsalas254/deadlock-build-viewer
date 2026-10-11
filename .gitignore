@@ -5,6 +5,7 @@ data/
 assets/game/fonts/
 
 # Local-only files.
+node_modules/
 __pycache__/
 *.pyc
 .claude/

@@ -5,6 +5,12 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Deadlock Build Viewer</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 1 14 8 8 15 2 8z' fill='%2370F8C1'/%3E%3C/svg%3E">
+<script>
+  // Start downloading the precomputed snapshot (tier list, heroes, meta builds) right away, so the
+  // page can draw from it the moment the main script runs. Skipped when building the snapshot itself.
+  window.snapshotRequest = new URLSearchParams(location.search).has('snapshot') ? null
+    : fetch('data/snapshot.json', { cache: 'no-cache' }).then(r => (r.ok ? r.json() : null)).catch(() => null);
+</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Jost:wght@400;500;600;700&display=swap">
@@ -667,6 +673,11 @@ const loadManifest = () => once('manifest', async () => {
     fetch(MANIFEST_URL, { cache: 'no-cache' }).then(r => (r.ok ? r.json() : null)).catch(() => null),
     getJSON(`${API}/assets/steam-info`).catch(() => null),
   ]);
+  return applyManifest(manifest, live);
+});
+
+// Puts the extracted-art manifest into use (also called with the snapshot's copy for an instant start).
+function applyManifest(manifest, live) {
   state.manifest = manifest;
   // If Deadlock has been patched since the art was extracted, hero/item/ability images could be
   // out of date, so use deadlock-api.com's copies (updated with each patch) until the art is refreshed.
@@ -684,7 +695,7 @@ const loadManifest = () => once('manifest', async () => {
     note.replaceChildren('Game assets not found, so images come from deadlock-api.com. ', localDataHint());
   }
   return manifest;
-});
+}
 
 // Browsers block a page opened straight from disk (file://) from reading the local data files, so the
 // extracted art, match sample and community talk all need the page served by tools/serve.py.
@@ -795,10 +806,23 @@ async function getJSON(url) {
   }
 }
 
-const loadAssets = () => once('items', async () => {
-  const list = await getJSON(`${API}/assets/items`);
-  return { byId: new Map(list.map(i => [i.id, i])), byClass: new Map(list.map(i => [i.class_name, i])) };
-});
+const indexItems = (list, full) => ({ byId: new Map(list.map(i => [i.id, i])), byClass: new Map(list.map(i => [i.class_name, i])), full });
+const loadAssets = () => once('items', async () => indexItems(await getJSON(`${API}/assets/items`), true));
+
+// "Fast" loaders: what the first screens need (names, icons, win counts), served instantly from the
+// precomputed snapshot when there is one. Without it they fall back to the full data below.
+const loadAssetsFast = () => once('assetsFast', loadAssets);
+const loadHeroesFast = () => once('heroesFast', () => loadHeroList());
+const loadMetaFast = rank => once(`metaFast:${rank}`, () => loadMeta(rank));
+
+// Swaps in the full item data (tooltips, build pages) once it has downloaded in the background.
+function upgradeAssets() {
+  if (state.assets?.full) return;
+  loadAssets().then(full => {
+    state.assets = full;
+    if (tipAnchor) showTip(tipAnchor);
+  }).catch(() => {});
+}
 const loadTags = () => once('tags', async () => new Map((await getJSON(`${API}/assets/build-tags`)).map(t => [t.id, t])));
 const loadHero = id => once(`hero:${id}`, () => getJSON(`${API}/assets/heroes/${id}`));
 const loadAuthor = id => once(`author:${id}`, async () => (await getJSON(`${API}/players/steam?account_ids=${id}`))[0] ?? null);
@@ -830,7 +854,7 @@ async function loadBuild(id) {
     const hero = await loadHero(versions[0].hero_id).catch(() => null);
     if (seq !== requestSeq) return;
 
-    Object.assign(state, { assets, tags, hero, versions, favorites, author: null });
+    Object.assign(state, { assets, tags, hero, versions, favorites, author: null, partial: false });
     render(versions[0]);
     hideStatus();
 
@@ -1063,24 +1087,36 @@ async function loadTopBuild(heroId) {
   $('#roster').hidden = true;
   showStatus('loading', 'Loading the top players’ build…');
   try {
-    const [tops, assets, tags, hero] = await Promise.all([loadTopBuilds(), loadAssets(), loadTags().catch(() => new Map()), loadHero(heroId), loadManifest()]);
+    const [tops, fastAssets, fastHeroes] = await Promise.all([loadTopBuilds(), loadAssetsFast(), loadHeroesFast(), loadManifest()]);
     if (seq !== requestSeq) return;
     const tb = tops?.heroes?.[heroId];
+    const listed = fastHeroes.find(h => h.id === heroId);
     if (!tb) {
-      showStatus('error', `No top-player build for ${hero?.name ?? 'this hero'} yet`,
+      showStatus('error', `No top-player build for ${listed?.name ?? 'this hero'} yet`,
         location.protocol === 'file:' || !tops ? 'The top players’ builds come from the local server. Open the site at http://localhost:8765 with python tools/serve.py running.'
           : 'Not enough Ascendant+ games with this hero in the last week. Its recommended community build is on the front page.');
       return;
     }
-    state.assets = assets;
-    const [abilityOrder, closest, allHeroes] = await Promise.all([loadTopAbilityOrder(heroId), closestSavedBuild(heroId, tb).catch(() => null), loadHeroList()]);
+    const heroNames = new Map(fastHeroes.map(h => [h.id, h.name]));
+    const show = build => {
+      render(build);
+      $('#build > .shop-panel')?.prepend(renderPlaySummary(build));
+      hideStatus();
+    };
+    // With the snapshot, the items and notes draw at once; the ability order, the closest saved
+    // build and the duel matchups follow when the full game data has downloaded.
+    if (listed && !fastAssets.full) {
+      if (!state.assets?.full) state.assets = fastAssets;
+      const preview = topBuildObject(listed, tb, [], tops.updated, heroNames);
+      Object.assign(state, { tags: new Map(), hero: listed, heroNames, versions: [preview], favorites: null, author: null, top: { tb, tops, pending: true }, partial: true });
+      show(preview);
+    }
+    const [assets, tags, hero, abilityOrder, closest] = await Promise.all([
+      loadAssets(), loadTags().catch(() => new Map()), loadHero(heroId), loadTopAbilityOrder(heroId), closestSavedBuild(heroId, tb).catch(() => null)]);
     if (seq !== requestSeq) return;
-    const heroNames = new Map(allHeroes.map(h => [h.id, h.name]));
     const build = topBuildObject(hero, tb, abilityOrder, tops.updated, heroNames);
-    Object.assign(state, { assets, tags, hero, heroNames, versions: [build], favorites: null, author: null, top: { tb, closest, tops } });
-    render(build);
-    $('#build > .shop-panel')?.prepend(renderPlaySummary(build));
-    hideStatus();
+    Object.assign(state, { assets, tags, hero, heroNames, versions: [build], favorites: null, author: null, top: { tb, closest, tops }, partial: false });
+    show(build);
   } catch (err) {
     if (seq !== requestSeq) return;
     showStatus('error', 'Couldn’t load the top players’ build', err.message,
@@ -1129,9 +1165,11 @@ async function loadHome() {
   if (HOME.tierFor !== HOME.rank) loadTierList();
   $('#homeNote').textContent = 'Loading heroes and match data since the latest patch…';
   try {
-    const [heroes, meta, assets, , dataWindow, top] = await Promise.all([loadHeroList(), loadMeta(HOME.rank), loadAssets(), loadManifest(), loadDataWindow(), loadTopBuilds()]);
+    const [heroes, meta, assets, , dataWindow, top] = await Promise.all([loadHeroesFast(), loadMetaFast(HOME.rank), loadAssetsFast(), loadManifest(), loadDataWindow(), loadTopBuilds()]);
     if (seq !== HOME.seq) return;
-    state.assets = assets;
+    // The cards only need names and icons; full item details arrive in the background for tooltips.
+    if (!state.assets?.full) state.assets = assets;
+    upgradeAssets();
     Object.assign(HOME, { heroes, meta, window: dataWindow, top });
     renderHomeGrid();
     // Heroes without a top players' build get a community build, streamed in per hero.
@@ -1850,7 +1888,7 @@ async function loadTierList() {
   HOME.modelProgress = n => { status.textContent = `Testing model settings on games it hasn’t seen… ${n}/${steps}`; };
   HOME.tierProgress = p => { status.textContent = `Simulating duels between every hero’s meta build… ${Math.round(p * 100)}%`; };
   try {
-    const [heroes, tiers, dataWindow] = await Promise.all([loadHeroList(), loadTiers(rank), loadDataWindow(), loadManifest()]);
+    const [heroes, tiers, dataWindow] = await Promise.all([loadHeroesFast(), loadTiers(rank), loadDataWindow(), loadManifest()]);
     if (HOME.tierFor !== rank) return;
     Object.assign(HOME, { tiers, tierHeroes: heroes, window: dataWindow });
     renderTierList();
@@ -2122,7 +2160,7 @@ async function showRoster() {
   box.hidden = false;
   if (!box.firstChild) box.append(el('div', { class: 'roster-screen' }, el('p', { class: 'roster-note', text: 'Working out the best roster from recent matches…' })));
   try {
-    const [entries, all, high, heroes] = await Promise.all([loadRosterHeroes(), loadTiers('all'), loadTiers('high'), loadHeroList(), loadManifest()]);
+    const [entries, all, high, heroes] = await Promise.all([loadRosterHeroes(), loadTiers('all'), loadTiers('high'), loadHeroesFast(), loadManifest()]);
     if (seq !== requestSeq) return;
     // Hovering a card shows the tier list's hero details.
     if (!HOME.tiers) Object.assign(HOME, { tiers: all, tierHeroes: heroes });
@@ -2301,7 +2339,8 @@ function renderPanel(b) {
         ? el('div', { class: 'categories' }, cats.map(renderCategory))
         : el('p', { class: 'cat-desc', text: 'This build has no item categories.' }),
       renderAbilityOrder(b),
-      renderMatchups(b)));
+      // Duel matchups need the full game data, so a snapshot preview leaves them for the full render.
+      !state.partial && renderMatchups(b)));
 }
 
 function renderHeader(b) {
@@ -2374,7 +2413,7 @@ function renderTopInfo(b, images, logo) {
       el('div', { class: 'meta' },
         closest
           ? el('span', {}, 'Closest saved build: ', el('strong', { text: closest.build.name }), ` (ID `, el('strong', { class: 'num', text: closest.build.hero_build_id }), `, has ${closest.covered} of ${closest.total} core items${skipText(closest)}). Copy Build copies it for the in-game browser.`)
-          : el('span', { text: 'No saved build is close enough to copy yet.' }),
+          : el('span', { text: state.top.pending ? 'Finding the closest saved build to copy…' : 'No saved build is close enough to copy yet.' }),
         el('span', { text: `Updated ${relativeDay(tops.updated)}` }))));
 }
 
@@ -3801,11 +3840,87 @@ for (const link of [$('#navHome'), $('#navRoster')]) {
   });
 }
 
-// A tab left open for a while reloads its live data when it comes back into view, so a new patch,
-// new builds or refreshed game art show up without a manual refresh.
+/* ---------- instant-load snapshot ---------- */
+
+// Everything the first screens show (tier lists for both ranks, heroes, item icons, meta builds, the
+// roster's heroes) is computed ahead of time: the deploy workflow opens this page in a headless
+// browser, calls buildSnapshot(), and publishes the result as data/snapshot.json. A visit then draws
+// straight from that file, with no API calls, match download or model fitting, and only fetches the
+// heavy details (full item data for tooltips and build pages) in the background.
+const SNAPSHOT_VERSION = 1;
+const SNAPSHOT_MAX_AGE_HOURS = 6; // older than this (updates paused?) and the page computes live instead
+
+const slimHero = h => ({ id: h.id, name: h.name, class_name: h.class_name, images: h.images, colors: h.colors,
+  player_selectable: h.player_selectable, prerelease_only: h.prerelease_only, in_development: h.in_development, disabled: h.disabled });
+const slimItem = i => ({ id: i.id, class_name: i.class_name, name: i.name, type: i.type, shopable: i.shopable, image: i.image, image_webp: i.image_webp,
+  shop_image: i.shop_image, shop_image_webp: i.shop_image_webp, item_slot_type: i.item_slot_type, item_tier: i.item_tier, cost: i.cost, is_active_item: i.is_active_item });
+
+// Only the commonly bought items are kept: that is all the hero cards and loadouts read.
+const packMeta = m => ({ accuracy: m.accuracy, totalMatches: m.totalMatches,
+  byHero: [...m.byHero].map(([id, h]) => [id, { matches: h.matches, wins: h.wins,
+    items: h.items.filter(r => r.matches / Math.max(1, h.matches) >= Math.min(META_MIN_PICK, CORE_MIN_PICK))
+      .map(r => ({ item_id: r.item_id, matches: r.matches, wins: r.wins, avg_buy_time_s: r.avg_buy_time_s })) }]) });
+const unpackMeta = m => ({ ...m, byHero: new Map(m.byHero) });
+
+// Tier results reference the TIERS table by key in the file and by object in memory.
+function packTiers(t) {
+  if (t.mode !== 'model') return null;
+  return {
+    mode: t.mode, rank: t.rank, coef: t.coef, tau: t.tau, fights: t.fights,
+    community: t.community && { posts: t.community.posts, comments: t.community.comments, source: t.community.source, updated: t.community.updated },
+    model: { matches: t.model.matches, best: t.model.best, test: t.model.test },
+    stats: [...t.stats].map(([id, s]) => [id, {
+      ...s, tier: s.tier.key, moved: s.moved && { ...s.moved, from: s.moved.from.key },
+      duel: s.duel && { wins: s.duel.wins, losses: s.duel.losses, draws: s.duel.draws, best: s.duel.best, worst: s.duel.worst, simplified: s.duel.simplified },
+    }]),
+  };
+}
+function unpackTiers(p) {
+  const tier = key => TIERS.find(t => t.key === key);
+  return { ...p, stats: new Map(p.stats.map(([id, s]) => [id, { ...s, tier: tier(s.tier), moved: s.moved && { ...s.moved, from: tier(s.moved.from) } }])) };
+}
+
+// Called by tools/snapshot.mjs on a page opened with ?snapshot=1 (which computes everything fresh).
+window.buildSnapshot = async () => {
+  const [heroes, assets, patches, metaAll, metaHigh, tiersAll, tiersHigh, topBuilds, roster, manifest, steam] = await Promise.all([
+    loadHeroList(), loadAssets(), loadPatches(), loadMeta('all'), loadMeta('high'), loadTiers('all'), loadTiers('high'), loadTopBuilds(), loadRosterHeroes(),
+    fetch(MANIFEST_URL, { cache: 'no-cache' }).then(r => (r.ok ? r.json() : null)).catch(() => null),
+    getJSON(`${API}/assets/steam-info`).catch(() => null),
+  ]);
+  return JSON.stringify({
+    version: SNAPSHOT_VERSION, built: Math.floor(Date.now() / 1000),
+    heroes: heroes.map(slimHero),
+    items: [...assets.byId.values()].filter(i => i.type === 'upgrade').map(slimItem),
+    patches, topBuilds, manifest, steam: steam && { client_version: steam.client_version },
+    meta: { all: packMeta(metaAll), high: packMeta(metaHigh) },
+    tiers: { all: packTiers(tiersAll), high: packTiers(tiersHigh) },
+    roster: roster.map(e => ({ hero: slimHero(e.hero), locked: e.locked, isNew: e.isNew })),
+  });
+};
+
+// Fills the loaders' cache from the snapshot so the first screens need nothing else.
+async function seedSnapshot(request = window.snapshotRequest) {
+  const snap = await request;
+  if (!snap || snap.version !== SNAPSHOT_VERSION || Date.now() / 1000 - snap.built > SNAPSHOT_MAX_AGE_HOURS * 3600) return false;
+  const ready = value => Promise.resolve(value);
+  memo.set('heroesFast', ready(snap.heroes));
+  memo.set('assetsFast', ready(indexItems(snap.items, false)));
+  memo.set('patches', ready(snap.patches));
+  memo.set('rosterHeroes', ready(snap.roster));
+  if (snap.topBuilds) memo.set('topBuilds', ready(snap.topBuilds));
+  for (const rank of ['all', 'high']) {
+    if (snap.meta?.[rank]) memo.set(`metaFast:${rank}`, ready(unpackMeta(snap.meta[rank])));
+    if (snap.tiers?.[rank]) memo.set(`tiers:${rank}`, ready(unpackTiers(snap.tiers[rank])));
+  }
+  if (snap.manifest) memo.set('manifest', ready(applyManifest(snap.manifest, snap.steam)));
+  return true;
+}
+
+// A tab left open for a while reloads its data when it comes back into view, so a new patch, new
+// builds or refreshed game art show up without a manual refresh.
 const DATA_MAX_AGE_MS = 30 * 60 * 1000;
 let dataLoadedAt = Date.now();
-document.addEventListener('visibilitychange', () => {
+document.addEventListener('visibilitychange', async () => {
   if (document.visibilityState !== 'visible' || Date.now() - dataLoadedAt < DATA_MAX_AGE_MS) return;
   dataLoadedAt = Date.now();
   memo.clear();
@@ -3814,6 +3929,7 @@ document.addEventListener('visibilitychange', () => {
   HOME.builds.clear();
   Object.assign(HOME, { tiers: null, tierFor: null, meta: null, window: null });
   MU.data = null;
+  if (window.snapshotRequest) await seedSnapshot(fetch('data/snapshot.json', { cache: 'no-cache' }).then(r => (r.ok ? r.json() : null)).catch(() => null));
   route();
 });
 
@@ -3822,8 +3938,10 @@ $('#lookup').addEventListener('submit', e => {
   go($('#buildId').value);
 });
 addEventListener('popstate', route);
-loadManifest();
-route();
+seedSnapshot().catch(() => false).then(() => {
+  loadManifest();
+  route();
+});
 </script>
 </body>
 </html>

@@ -69,6 +69,21 @@ jobs:
           done
           touch _site/.nojekyll
 
+      # Precompute what the first screens show, so a visit draws at once instead of downloading the
+      # match sample and fitting the model in the visitor's browser. Without it the site still works.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build the instant-load snapshot
+        continue-on-error: true
+        timeout-minutes: 6
+        run: |
+          npm install --no-save --no-package-lock --no-audit --no-fund playwright-core
+          python -m http.server 8000 --directory _site > /dev/null 2>&1 &
+          sleep 2
+          node tools/snapshot.mjs http://localhost:8000/ _site/data/snapshot.json
+
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site
