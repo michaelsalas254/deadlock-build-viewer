@@ -1,12 +1,16 @@
-# Keeps the public site current without a computer running: every 30 minutes this refreshes the
-# match sample, the top players' meta builds and (every 6 hours) community balance talk, then
-# publishes the site to GitHub Pages. The bulky caches carry over between runs in the Actions
-# cache instead of the repository.
+# Keeps the public site current with nobody running anything. It refreshes the match sample, the top
+# players' meta builds, community balance talk and the game art, precomputes what the first screens
+# show, publishes the site to GitHub Pages, then checks what it published. The bulky caches carry
+# over between runs in the Actions cache instead of the repository.
+#
+# GitHub drops many scheduled runs, so this is triggered every 15 minutes and the first job skips
+# the runs with nothing to do: a rebuild happens when the published data is about half an hour old,
+# or at once when the game has been updated (a new game version or a new update post).
 name: Update data and deploy
 
 on:
   schedule:
-    - cron: "17,47 * * * *"
+    - cron: "7,22,37,52 * * * *"
   push:
     branches: [main]
   workflow_dispatch:
@@ -15,13 +19,38 @@ permissions:
   contents: read
   pages: write
   id-token: write
+  actions: write # only to re-enable this workflow's own schedule (see "Keep the schedule alive")
 
 concurrency:
   group: pages
   cancel-in-progress: false
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      needed: ${{ steps.due.outputs.needed }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # If the check itself breaks, rebuild anyway rather than let the site go stale.
+      - name: Is a rebuild due?
+        id: due
+        run: python3 tools/update_due.py >> "$GITHUB_OUTPUT" || echo "needed=true" >> "$GITHUB_OUTPUT"
+
+      # GitHub switches off scheduled workflows in repositories with no commits for 60 days.
+      # Re-enabling the workflow counts as activity, so the updates keep running on their own.
+      - name: Keep the schedule alive
+        if: github.event_name == 'schedule'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/deploy.yml/enable" --silent
+
   build:
+    needs: check
+    if: needs.check.outputs.needed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -52,18 +81,22 @@ jobs:
         continue-on-error: true
         timeout-minutes: 4
 
-      - name: Save data caches
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: data
-          key: data-${{ github.run_id }}
+      # The committed art was extracted from a game install. When the game moves past it, the same
+      # images are mirrored from deadlock-api.com, so new and changed art needs no one's computer.
+      - name: Mirror updated game art
+        run: python -u tools/mirror_art.py
+        continue-on-error: true
+        timeout-minutes: 8
 
       - name: Assemble the site
         run: |
           mkdir -p _site/data
           cp index.html _site/
           cp -r assets _site/
+          if [ -f data/art/manifest.json ]; then
+            if [ -d data/art/game ]; then cp -r data/art/game/. _site/assets/game/; fi
+            cp data/art/manifest.json _site/assets/game/manifest.json
+          fi
           for f in matches.json top_builds.json community.json; do
             if [ -f "data/$f" ]; then cp "data/$f" _site/data/; fi
           done
@@ -83,6 +116,22 @@ jobs:
           python -m http.server 8000 --directory _site > /dev/null 2>&1 &
           sleep 2
           node tools/snapshot.mjs http://localhost:8000/ _site/data/snapshot.json
+          cp _site/data/snapshot.json data/last_snapshot.json
+
+      # A run that couldn't build one publishes the last good one, so visits stay instant.
+      - name: Fall back to the last good snapshot
+        run: |
+          if [ ! -s _site/data/snapshot.json ] && [ -s data/last_snapshot.json ]; then
+            cp data/last_snapshot.json _site/data/snapshot.json
+            echo "::warning::This run couldn't build the snapshot; published the last good one."
+          fi
+
+      - name: Save data caches
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: data-${{ github.run_id }}
 
       - uses: actions/upload-pages-artifact@v3
         with:
@@ -97,3 +146,48 @@ jobs:
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4
+
+  # The alarm for a site nobody is watching: reads what was actually published and fails the run
+  # (GitHub emails the owner) when something needs a person. At most one alert a day.
+  verify:
+    needs: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the published site
+        id: health
+        continue-on-error: true
+        run: |
+          sleep 30
+          python3 tools/check_site.py
+
+      - name: Note today's date
+        if: steps.health.outcome == 'failure'
+        id: day
+        run: echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+
+      - name: Has today's alert already gone out?
+        if: steps.health.outcome == 'failure'
+        id: alerted
+        uses: actions/cache/restore@v4
+        with:
+          path: .alert
+          key: alert-${{ steps.day.outputs.day }}
+
+      - name: Record today's alert
+        if: steps.health.outcome == 'failure' && steps.alerted.outputs.cache-hit != 'true'
+        run: mkdir -p .alert && date -u > .alert/sent
+
+      - if: steps.health.outcome == 'failure' && steps.alerted.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .alert
+          key: alert-${{ steps.day.outputs.day }}
+
+      - name: Raise the alert
+        if: steps.health.outcome == 'failure' && steps.alerted.outputs.cache-hit != 'true'
+        run: |
+          echo "::error::The site needs attention. See the 'Check the published site' step for what is wrong."
+          exit 1

@@ -788,6 +788,8 @@ function applyManifest(manifest, live) {
   if (state.artOutdated) {
     note.replaceChildren(`Deadlock is on version ${current} but the extracted art is from version ${extracted}, so hero and item images come from deadlock-api.com for now.`,
       ...(local ? [' Restart the viewer (', el('code', { text: 'python tools/serve.py' }), ') to refresh the art from your updated game.'] : []));
+  } else if (manifest?.mirrored_at && !local) {
+    note.replaceChildren(`Hero and item art is from Deadlock version ${manifest.game_version}, refreshed ${new Date(manifest.mirrored_at).toLocaleDateString()}.`);
   } else if (manifest) {
     note.replaceChildren(`Images, UI art and fonts extracted from your Deadlock install (game version ${manifest.game_version ?? 'unknown'}, ${new Date(manifest.extracted_at).toLocaleDateString()}).`);
   } else {
@@ -818,7 +820,7 @@ const MAX_WINDOW_DAYS = 30;
 // a name ("City Never Sleeps") counts too, from when it was posted, because its dated changelog
 // entry can follow days later. New-hero announcements change no numbers and aren't patches.
 const NAMED_UPDATE = /\b(updates?|patch(es)?|changelog)\b/i;
-const loadPatches = () => once('patches', async () => {
+async function fetchPatches() {
   const rows = await getJSON(`${API_ROOT}/v2/patches`).catch(() => []);
   const found = [];
   for (const r of rows) {
@@ -835,7 +837,8 @@ const loadPatches = () => once('patches', async () => {
   }
   found.sort((a, b) => b.time - a.time);
   return found.filter((p, i) => !found.slice(0, i).some(q => Math.abs(q.time - p.time) < 12 * 3600));
-});
+}
+const loadPatches = () => once('patches', fetchPatches);
 
 // The window all stats use: since the newest patch that has a full day of matches.
 const loadDataWindow = () => once('window', async () => {
@@ -4452,7 +4455,41 @@ async function seedSnapshot(request = window.snapshotRequest) {
     if (snap.tiers?.[rank]) memo.set(`tiers:${rank}`, ready(unpackTiers(snap.tiers[rank])));
   }
   if (snap.manifest) memo.set('manifest', ready(applyManifest(snap.manifest, snap.steam)));
-  return true;
+  return snap;
+}
+
+// The snapshot is rebuilt every few hours at best, and a game update can land in between. Two small
+// requests tell the page, which then stops trusting what the update could have changed instead of
+// showing the old game until the next rebuild:
+//   - a new game build: art comes from the live copies, and the item numbers behind the counter
+//     page are worked out again from the live game data (tooltips and build pages read it anyway);
+//   - a new patch: the patch list, so the page says the update landed and when stats switch to it.
+// Win rates and tiers stay as they are: they need matches played on the new patch first.
+async function checkGameUpdate(snap) {
+  if (!snap) return;
+  const [live, patches] = await Promise.all([getJSON(`${API}/assets/steam-info`).catch(() => null), fetchPatches()]);
+  const newBuild = Number(live?.client_version) > Number(snap.steam?.client_version);
+  const newPatch = (patches[0]?.time ?? 0) > (snap.patches?.[0]?.time ?? Infinity);
+  if (!newBuild && !newPatch) return;
+  const onView = view => { const p = new URLSearchParams(location.search); return !p.has('id') && !p.has('top') && (p.get('view') ?? 'home') === view; };
+  if (newBuild) {
+    if (snap.manifest) memo.set('manifest', Promise.resolve(applyManifest(snap.manifest, live)));
+    // The snapshot's counter data keeps serving until the live version is ready (or if it fails).
+    const seeded = memo.get('counterData');
+    memo.delete('counterData');
+    const fresh = loadCounterData();
+    if (seeded) memo.set('counterData', seeded);
+    fresh.then(data => {
+      memo.set('counterData', Promise.resolve(data));
+      if (onView('counter')) showCounter();
+    }, () => { if (seeded) memo.set('counterData', seeded); });
+  }
+  if (newPatch) {
+    memo.set('patches', Promise.resolve(patches));
+    memo.delete('window');
+    HOME.window = null;
+    if (onView('home') || onView('roster')) route();
+  }
 }
 
 // A tab left open for a while reloads its data when it comes back into view, so a new patch, new
@@ -4468,8 +4505,9 @@ document.addEventListener('visibilitychange', async () => {
   HOME.builds.clear();
   Object.assign(HOME, { tiers: null, tierFor: null, meta: null, window: null });
   MU.data = null;
-  if (window.snapshotRequest) await seedSnapshot(fetch('data/snapshot.json', { cache: 'no-cache' }).then(r => (r.ok ? r.json() : null)).catch(() => null));
+  const snap = window.snapshotRequest && await seedSnapshot(fetch('data/snapshot.json', { cache: 'no-cache' }).then(r => (r.ok ? r.json() : null)).catch(() => null));
   route();
+  checkGameUpdate(snap).catch(() => {});
 });
 
 $('#lookup').addEventListener('submit', e => {
@@ -4477,9 +4515,10 @@ $('#lookup').addEventListener('submit', e => {
   go($('#buildId').value);
 });
 addEventListener('popstate', route);
-seedSnapshot().catch(() => false).then(() => {
+seedSnapshot().catch(() => false).then(snap => {
   loadManifest();
   route();
+  checkGameUpdate(snap).catch(() => {});
 });
 </script>
 </body>
