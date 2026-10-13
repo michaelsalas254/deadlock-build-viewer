@@ -65,16 +65,28 @@ def shop_items():
     return out
 
 
+NAMED_UPDATE = re.compile(r"\b(updates?|patch(es)?|changelog)\b", re.I)
+
+
 def latest_patch_time(now):
-    """Start time of the newest dated game update (titles carry the date, like '10-05-2026')."""
+    """Start time of the newest game update.
+
+    Balance patches carry their date in the title ('10-05-2026'). A big update announced under a
+    name ('City Never Sleeps') counts too, from when it was posted, because its dated changelog
+    entry can follow days later. New-hero announcements change no numbers and aren't patches.
+    """
     best = 0
     for post in fetch_json(f"{API_ROOT}/v2/patches"):
-        m = re.search(r"(\d{2})-(\d{2})-(\d{4})", post.get("title") or "")
-        if not m:
+        title = post.get("title") or ""
+        posted = calendar.timegm(time.strptime(post["pub_date"][:19], "%Y-%m-%dT%H:%M:%S")) if post.get("pub_date") else 0
+        m = re.search(r"(\d{2})-(\d{2})-(\d{4})", title)
+        if m:
+            day = calendar.timegm((int(m[3]), int(m[1]), int(m[2]), 0, 0, 0))
+            t = posted if day <= posted < day + 36 * 3600 else day + 20 * 3600
+        elif posted and NAMED_UPDATE.search(title + " " + re.sub(r"<[^>]+>", " ", post.get("content") or "")):
+            t = posted
+        else:
             continue
-        day = calendar.timegm((int(m[3]), int(m[1]), int(m[2]), 0, 0, 0))
-        posted = calendar.timegm(time.strptime(post["pub_date"][:19], "%Y-%m-%dT%H:%M:%S")) if post.get("pub_date") else day
-        t = posted if day <= posted < day + 36 * 3600 else day + 20 * 3600
         if t <= now:
             best = max(best, t)
     return best

@@ -813,19 +813,25 @@ function localDataHint() {
 const PATCH_MIN_HOURS = 24; // a new patch needs a day of matches before the stats switch to it
 const MAX_WINDOW_DAYS = 30;
 
-// Game updates from the official changelog and Steam news, newest first. Titles carry the
-// patch date ("09-29-2026", "Minor Update - 10-05-2026").
+// Game updates from the official changelog and Steam news, newest first. Balance patches carry
+// their date in the title ("09-29-2026", "Minor Update - 10-05-2026"). A big update announced under
+// a name ("City Never Sleeps") counts too, from when it was posted, because its dated changelog
+// entry can follow days later. New-hero announcements change no numbers and aren't patches.
+const NAMED_UPDATE = /\b(updates?|patch(es)?|changelog)\b/i;
 const loadPatches = () => once('patches', async () => {
   const rows = await getJSON(`${API_ROOT}/v2/patches`).catch(() => []);
   const found = [];
   for (const r of rows) {
-    const m = /(\d{2})-(\d{2})-(\d{4})/.exec(r.title ?? '');
-    if (!m) continue;
-    const day = Date.UTC(+m[3], +m[1] - 1, +m[2]) / 1000;
+    const title = (r.title ?? '').trim();
     const posted = Date.parse(r.pub_date) / 1000;
-    // Posts usually go up within hours of the patch; otherwise assume a typical evening (UTC) release.
-    const time = posted >= day && posted - day < 36 * 3600 ? posted : day + 20 * 3600;
-    found.push({ time, title: r.title.trim(), link: r.link });
+    const m = /(\d{2})-(\d{2})-(\d{4})/.exec(title);
+    if (m) {
+      const day = Date.UTC(+m[3], +m[1] - 1, +m[2]) / 1000;
+      // Posts usually go up within hours of the patch; otherwise assume a typical evening (UTC) release.
+      found.push({ time: posted >= day && posted - day < 36 * 3600 ? posted : day + 20 * 3600, title, link: r.link });
+    } else if (posted && NAMED_UPDATE.test(`${title} ${(r.content ?? '').replace(/<[^>]+>/g, ' ')}`)) {
+      found.push({ time: posted, title, link: r.link });
+    }
   }
   found.sort((a, b) => b.time - a.time);
   return found.filter((p, i) => !found.slice(0, i).some(q => Math.abs(q.time - p.time) < 12 * 3600));
@@ -4378,7 +4384,9 @@ for (const link of [$('#navHome'), $('#navRoster'), $('#navCounter')]) {
 // straight from that file, with no API calls, match download or model fitting, and only fetches the
 // heavy details (full item data for tooltips and build pages) in the background.
 const SNAPSHOT_VERSION = 1;
-const SNAPSHOT_MAX_AGE_HOURS = 6; // older than this (updates paused?) and the page computes live instead
+// Older than this (updates paused?) and the page computes live instead. GitHub runs the scheduled
+// update every few hours rather than on the dot, so the limit leaves plenty of room between runs.
+const SNAPSHOT_MAX_AGE_HOURS = 48;
 
 const slimHero = h => ({ id: h.id, name: h.name, class_name: h.class_name, images: h.images, colors: h.colors,
   player_selectable: h.player_selectable, prerelease_only: h.prerelease_only, in_development: h.in_development, disabled: h.disabled });
