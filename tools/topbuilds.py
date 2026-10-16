@@ -20,13 +20,15 @@ import time
 import urllib.error
 import urllib.request
 from collections import Counter, defaultdict
+from html import unescape
 
 API_ROOT = "https://api.deadlock-api.com"
 API = f"{API_ROOT}/v1"
 USER_AGENT = "deadlock-build-viewer/1.0 (personal fan site)"
 TOP_BADGE = 100            # Ascendant and up
 KEEP_DAYS = 7
-PATCH_MIN_HOURS = 36       # after a patch, wait this long before using only post-patch games
+PATCH_MIN_HOURS = 24       # after a patch, wait this long before using only post-patch games
+EARLY_MIN_GAMES = 200      # ...except heroes the patch changed, who switch once they have this many
 WINDOW_SECONDS = 3 * 3600
 SETTLE_SECONDS = 8 * 3600
 REQUEST_GAP_SECONDS = 1.0
@@ -68,14 +70,29 @@ def shop_items():
 NAMED_UPDATE = re.compile(r"\b(updates?|patch(es)?|changelog)\b", re.I)
 
 
-def latest_patch_time(now):
-    """Start time of the newest game update.
+def patch_changes(html):
+    """A patch post's lines by the name they start with: '- Baba: Threadsap - ...' files under 'Baba'."""
+    text = unescape(re.sub(r"<[^>]+>", " ", re.sub(r"<br\s*/?>|</(li|p|div|h\d)>", "\n", html or "", flags=re.I)))
+    changes = {}
+    for line in text.split("\n"):
+        m = re.match(r"^\s*[-•*]\s*([^:]{2,40}?):\s*(.+?)\s*$", line)
+        if m:
+            changes.setdefault(m[1].strip(), []).append(m[2])
+    return changes
+
+
+def name_key(name):
+    return re.sub(r"[^a-z0-9]", "", re.sub(r"^the\s+", "", name.lower()).replace("&", "and"))
+
+
+def latest_patch(now):
+    """Start time of the newest game update, and what its notes changed (name -> lines).
 
     Balance patches carry their date in the title ('10-05-2026'). A big update announced under a
     name ('City Never Sleeps') counts too, from when it was posted, because its dated changelog
     entry can follow days later. New-hero announcements change no numbers and aren't patches.
     """
-    best = 0
+    found = []
     for post in fetch_json(f"{API_ROOT}/v2/patches"):
         title = post.get("title") or ""
         posted = calendar.timegm(time.strptime(post["pub_date"][:19], "%Y-%m-%dT%H:%M:%S")) if post.get("pub_date") else 0
@@ -88,8 +105,17 @@ def latest_patch_time(now):
         else:
             continue
         if t <= now:
-            best = max(best, t)
-    return best
+            found.append((t, patch_changes(post.get("content"))))
+    if not found:
+        return 0, {}
+    best = max(t for t, _ in found)
+    # The same patch is often posted twice (Steam news and the forum changelog); merge their notes.
+    changes = {}
+    for t, c in found:
+        if abs(t - best) < 12 * 3600:
+            for name, lines in c.items():
+                changes.setdefault(name, lines)
+    return best, changes
 
 
 def fetch_window(start, items):
@@ -372,14 +398,21 @@ def refresh(root, log=print):
     items = shop_items()
     data = refresh_purchases(os.path.join(root, "data", "top_purchases.json"), items, log)
     now = int(time.time())
-    patch = latest_patch_time(now)
+    patch, changes = latest_patch(now)
     # Right after a patch, older games describe the old game; once there's enough, use only new ones.
     since = patch if now - patch >= PATCH_MIN_HOURS * 3600 else 0
+    # Heroes the patch notes name switch sooner: their old games are the least like the new game.
+    hero_since = {}
+    if patch and not since and changes:
+        ids = {name_key(h["name"]): h["id"] for h in fetch_json("/assets/heroes?only_active=true")}
+        changed = {ids[name_key(n)] for n in changes if name_key(n) in ids}
+        counts = Counter(g[2] for g in data["games"] if g[1] >= patch and g[5])
+        hero_since = {h: patch for h in changed if counts[h] >= EARLY_MIN_GAMES}
     by_hero = defaultdict(list)
     by_match = defaultdict(list)
     for g in data["games"]:
         g.append({i for i, _t, _s in g[5]})  # g[6]: the items bought, for quick lookups
-        if g[1] >= since and g[5]:
+        if g[1] >= hero_since.get(g[2], since) and g[5]:
             by_hero[g[2]].append(g)
         by_match[g[0]].append(g)
     # Each player's enemies: the players in the same match with the other result.
@@ -391,12 +424,14 @@ def refresh(root, log=print):
             heroes[str(hero_id)] = b
     recent = [g for games in by_hero.values() for g in games]
     out = {"updated": now, "minBadge": TOP_BADGE, "days": KEEP_DAYS, "sincePatch": since or None,
-           "games": len(recent), "heroes": heroes, "counters": counter_stats(recent, enemies)}
+           "games": len(recent), "heroes": heroes, "counters": counter_stats(recent, enemies),
+           "heroSince": {str(h): t for h, t in hero_since.items()}}
     path = os.path.join(root, "data", "top_builds.json")
     with open(path + ".tmp", "w", encoding="utf-8") as f:
         json.dump(out, f, separators=(",", ":"))
     os.replace(path + ".tmp", path)
-    log(f"Top builds: wrote meta builds for {len(heroes)} heroes from {out['games']} top-player games.")
+    log(f"Top builds: wrote meta builds for {len(heroes)} heroes from {out['games']} top-player games"
+        + (f"; {len(hero_since)} heroes the latest patch changed already use only games since it." if hero_since else "."))
     return out
 
 
