@@ -23,6 +23,10 @@ capacity, so in practice a rebuild lands every few hours. Each rebuild:
   fails the run, which GitHub emails to the repository owner, if something needs a person
 
 Stats are measured since the latest balance patch, which the tools find from the game's update posts.
+They also read each patch's notes: heroes the notes name, and heroes whose top players rely on an
+item the notes change, move in the tier list as soon as games on the new patch come in, and their
+meta builds switch to post-patch games early. If the notes ever stop being readable, the health
+check says so.
 Between rebuilds the page checks the live game version itself on every visit and, if the game has
 moved on, reads item numbers and art from the live game data instead of the precomputed copy.
 

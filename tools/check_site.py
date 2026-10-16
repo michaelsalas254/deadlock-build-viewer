@@ -8,13 +8,35 @@ or a game update renamed a stat and one kind of counter item came up empty.
 Usage (run by the deploy workflow):
     python tools/check_site.py
 """
+import calendar
 import os
+import re
 import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from topbuilds import fetch_json  # noqa: E402
+from topbuilds import API_ROOT, fetch_json, name_key, patch_changes  # noqa: E402
 from update_due import site_url  # noqa: E402
+
+NUMBER_CHANGE = re.compile(r"\bfrom\s+[-+]?[\d.]+.*\bto\s+[-+]?[\d.]+", re.I)
+
+
+def unreadable_patch(snap, now):
+    """The newest balance patch, if its notes change numbers but name no hero or item the site knows.
+
+    The site moves heroes as soon as a patch's notes name them (or an item they rely on), which only
+    works while the notes keep their "- Name: change" lines. If Valve changes the format, say so.
+    """
+    known = {name_key(x["name"]) for x in (snap.get("heroes") or []) + (snap.get("items") or []) if x.get("name")}
+    for post in fetch_json(f"{API_ROOT}/v2/patches", tries=2):
+        title = (post.get("title") or "").strip()
+        posted = calendar.timegm(time.strptime(post["pub_date"][:19], "%Y-%m-%dT%H:%M:%S")) if post.get("pub_date") else 0
+        if not re.search(r"\d{2}-\d{2}-\d{4}", title) or not 0 <= now - posted <= 7 * 86400:
+            continue
+        text = re.sub(r"<[^>]+>", "\n", post.get("content") or "")
+        if sum(bool(NUMBER_CHANGE.search(line)) for line in text.split("\n")) >= 3 and not any(name_key(n) in known for n in patch_changes(post.get("content"))):
+            return title
+    return None
 
 MAX_AGE_HOURS = 24
 MIN_HEROES = 30
@@ -61,6 +83,12 @@ def main():
         print(f"PROBLEM: the site's instant-load data couldn't be read ({err}).")
         return 1
     found = problems(snap, time.time())
+    try:
+        title = unreadable_patch(snap, time.time())
+        if title:
+            found.append(f"the notes of the {title} update changed numbers but no hero or item could be read from them (the notes' format may have changed), so the tier list can't react to it early")
+    except Exception as err:
+        print(f"Note: couldn't check the latest patch notes ({err}).")
     try:
         live = fetch_json("/assets/steam-info", tries=2).get("client_version")
         art = int((snap.get("manifest") or {}).get("game_version") or 0)

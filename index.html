@@ -878,12 +878,35 @@ function patchedHeroes(patch, heroes) {
   }
   return out;
 }
+// Who a patch affects: the heroes its notes name, and the heroes whose top players rely on an item
+// it changed (buy it in at least ITEM_RELIANCE of their games). Hero id -> { lines, direct }.
+const ITEM_RELIANCE = 0.3;
+function patchTouches(patch, heroes, items = [], tops = null) {
+  const out = new Map();
+  const add = (id, line, direct) => {
+    const t = out.get(id) ?? out.set(id, { lines: [], direct: false }).get(id);
+    t.lines.push(line);
+    t.direct ||= direct;
+  };
+  for (const [id, lines] of patchedHeroes(patch, heroes)) for (const line of lines) add(id, line, true);
+  const shop = new Map(items.filter(i => i.type === 'upgrade' && i.shopable).map(i => [nameKey(i.name), i]));
+  for (const [name, lines] of Object.entries(patch?.changes ?? {})) {
+    const item = shop.get(nameKey(name));
+    if (!item) continue;
+    for (const h of heroes) {
+      const rate = tops?.heroes?.[h.id]?.rates?.[item.id] ?? 0;
+      if (rate >= ITEM_RELIANCE) for (const line of lines) add(h.id, `${item.name} (in ${pct(rate)} of their top players’ builds): ${line}`, false);
+    }
+  }
+  return out;
+}
+const shopItems = () => [...(state.assets?.byId.values() ?? [])];
 // What the newest patch (if it is under two weeks old) changed for one hero, for their build page.
-function recentPatchFor(heroId, patches, heroes) {
+function recentPatchFor(heroId, patches, heroes, items, tops) {
   const now = Date.now() / 1000;
   const newest = patches.find(p => p.time <= now);
-  const lines = newest && now - newest.time < 14 * 86400 ? patchedHeroes(newest, heroes).get(heroId) : null;
-  return lines ? { title: newest.title, link: newest.link, lines } : null;
+  const touch = newest && now - newest.time < 14 * 86400 ? patchTouches(newest, heroes, items, tops).get(heroId) : null;
+  return touch ? { title: newest.title, link: newest.link, ...touch } : null;
 }
 // The heroes and items a patch changed, by name, for notes ("Baba, Deadman Danny and Radiant Regeneration").
 function patchedNames(patch, heroes = HOME.tierHeroes ?? []) {
@@ -915,7 +938,7 @@ function windowNotes(w) {
     w.pending && [
       ' · New update ', el('a', { href: w.pending.link, target: '_blank', rel: 'noopener', text: `“${w.pending.title}”` }),
       ` landed ${Math.max(1, Math.round((Date.now() / 1000 - w.pending.time) / 3600))}h ago`,
-      changed.length ? `, changing ${listText(changed.length > 6 ? [...changed.slice(0, 6), `${changed.length - 6} more`] : changed)}. The tier list already counts games since then for the heroes it changed; win rates and builds switch to it once it has half a day of matches.`
+      changed.length ? `, changing ${listText(changed.length > 6 ? [...changed.slice(0, 6), `${changed.length - 6} more`] : changed)}. The tier list already counts games since then for the heroes it changed and the heroes who rely on items it changed; win rates and builds switch to it once it has half a day of matches.`
         : '; win rates and builds switch to it once it has half a day of matches.',
     ],
   ];
@@ -1263,7 +1286,7 @@ async function loadTopBuild(heroId) {
       return;
     }
     const heroNames = new Map(fastHeroes.map(h => [h.id, h.name]));
-    const patch = recentPatchFor(heroId, patches, fastHeroes);
+    const patch = recentPatchFor(heroId, patches, fastHeroes, [...fastAssets.byId.values()], tops);
     const show = build => {
       render(build);
       $('#build > .shop-panel')?.prepend(renderPlaySummary(build));
@@ -1369,7 +1392,7 @@ function renderHomeGrid() {
     name: (a, b) => a.hero.name.localeCompare(b.hero.name),
   };
   const newest = HOME.window?.pending ?? HOME.window?.patch;
-  const patched = newest ? patchedHeroes(newest, HOME.heroes) : new Map();
+  const patched = newest ? patchTouches(newest, HOME.heroes, shopItems(), HOME.top) : new Map();
   const list = HOME.heroes
     .filter(hero => !query || hero.name.toLowerCase().includes(query))
     .map(hero => {
@@ -1377,8 +1400,8 @@ function renderHomeGrid() {
       const matches = h?.matches ?? 0;
       const tb = HOME.top?.heroes?.[hero.id];
       const core = tb ? topCore(tb).map(s => state.assets.byId.get(s.id)).filter(Boolean) : coreItems(hero.id);
-      const lines = patched.get(hero.id);
-      return { hero, matches, winRate: matches ? h.wins / matches : 0, pickRate: total ? matches / total : 0, core, tb, patch: lines && { title: newest.title, lines } };
+      const touch = patched.get(hero.id);
+      return { hero, matches, winRate: matches ? h.wins / matches : 0, pickRate: total ? matches / total : 0, core, tb, patch: touch && { title: newest.title, ...touch } };
     })
     .sort(sorts[HOME.sort]);
   grid.replaceChildren(...list.map(heroCard));
@@ -1409,7 +1432,7 @@ function heroCard({ hero, matches, winRate, pickRate, core, tb, patch }) {
       el('div', { class: 'hc-title' },
         el('h2', { text: hero.name }),
         matches > 0 && el('span', { class: `hc-wr${winRate >= 0.51 ? ' good' : winRate < 0.47 ? ' bad' : ''}`, title: `Win rate ${windowText(HOME.window)}`, text: `${pct1(winRate)} WR` }),
-        patch && el('span', { class: 'hc-patch', tabindex: 0, title: `Changed in the ${patch.title} update:\n${patch.lines.map(l => `• ${l}`).join('\n')}`, text: 'Patched' }))),
+        patch && el('span', { class: 'hc-patch', tabindex: 0, title: `${patch.direct ? 'Changed in' : 'An item they rely on changed in'} the ${patch.title} update:\n${patch.lines.map(l => `• ${l}`).join('\n')}`, text: 'Patched' }))),
     el('div', { class: 'hc-body' },
       el('div', { class: 'hc-line', text: matches ? `Picked in ${pct1(pickRate)} of matches · ${fmtNum(matches)} games` : 'No recent match data' }),
       el('div', { class: 'hc-label', text: tb ? `Top players’ core · ${STYLE_NAMES[tb.style]}, in buy order` : 'Core items' }),
@@ -1633,9 +1656,10 @@ const shrunkRate = (wins, matches, k) => (wins + k / 2) / (matches + k);
 // The tier list for a rank ('all' or 'high'). With the local match sample it comes from the strength
 // model; without it (page not served by tools/serve.py), from a weighted blend of the same factors.
 const loadTiers = (rank = 'all') => once(`tiers:${rank}`, async () => {
-  const [heroes, duels, match, community, bans, model] = await Promise.all([
+  const [heroes, duels, match, community, bans, model, assets, tops] = await Promise.all([
     loadHeroList(), loadDuels(), loadMatchStats(), loadCommunity(), loadBans(),
     fitHeroModel(rank, n => HOME.modelProgress?.(n)).catch(err => { console.warn('Hero model failed', err); return null; }),
+    loadAssetsFast(), loadTopBuilds(),
   ]);
   const ids = heroes.map(h => h.id).filter(id => duels.stats.has(id) || match.all.has(id));
   const raw = Object.fromEntries(TIER_FACTORS.map(f => [f.key, new Map()]));
@@ -1699,9 +1723,9 @@ const loadTiers = (rank = 'all') => once(`tiers:${rank}`, async () => {
     const earlier = model.before ? combineWithFactors(model.before, z, ids) : null;
     const tierIndex = t => TIERS.indexOf(t);
     // Heroes the latest patch changed: its notes for them, and how much it moved them so far.
-    const patchedNow = model.patch ? patchedHeroes(model.patch, heroes) : new Map();
+    const patchedNow = model.patch ? patchTouches(model.patch, heroes, [...assets.byId.values()], tops) : new Map();
     const patchedInfo = (id, m) => patchedNow.has(id) && {
-      title: model.patch.title, link: model.patch.link, lines: patchedNow.get(id),
+      title: model.patch.title, link: model.patch.link, ...patchedNow.get(id),
       change: m?.change ? effectOf(m.strength) - effectOf(m.strength - m.change.strength) : null,
       changeSe: m?.change ? m.change.se / 4 : null,
     };
@@ -1854,7 +1878,8 @@ function attachPatchTerms(d, terms) {
     most = Math.max(most, param.length - start[i]);
   }
   start[d.n] = param.length;
-  Object.assign(d, { terms, termStart: start, termParam: Int32Array.from(param), termSign: Float64Array.from(sign), maxTerms: most });
+  Object.assign(d, { terms, termStart: start, termParam: Int32Array.from(param), termSign: Float64Array.from(sign), maxTerms: most,
+    termRidge: Float64Array.from(terms, t => t.ridge ?? MODEL_PATCH_RIDGE) });
 }
 
 // The parameters (and their signs) one game's prediction uses: 12 heroes, the side term, its patch terms.
@@ -1891,7 +1916,7 @@ function fitStrengths(d, w, start = null) {
       }
     }
     for (let j = 0; j < K; j++) { g[j] -= MODEL_RIDGE * beta[j]; H[j * P + j] += MODEL_RIDGE; }
-    for (let j = K + 1; j < P; j++) { g[j] -= MODEL_PATCH_RIDGE * beta[j]; H[j * P + j] += MODEL_PATCH_RIDGE; }
+    for (let j = K + 1; j < P; j++) { const r = d.termRidge?.[j - K - 1] ?? MODEL_PATCH_RIDGE; g[j] -= r * beta[j]; H[j * P + j] += r; }
     H[K * P + K] += 1e-6;
     chol = cholesky(H, P);
     const step = chol.solve(g);
@@ -1977,7 +2002,7 @@ function poolTests(tests) {
 
 // Picks the half-life and pre-patch weight that best predict the latest day, then fits on everything.
 async function fitHeroModel(rank, progress) {
-  const [sample, patches, match, heroList] = await Promise.all([loadMatchSample(), loadPatches(), loadMatchStats(), loadHeroesFast()]);
+  const [sample, patches, match, heroList, assets, tops] = await Promise.all([loadMatchSample(), loadPatches(), loadMatchStats(), loadHeroesFast(), loadAssetsFast(), loadTopBuilds()]);
   if (!sample?.matches?.length) return null;
   const total = rows => [...rows.values()].reduce((s, r) => s + r.matches, 0);
   const d = prepareMatches(sample, rank, total(match.high) / Math.max(1, total(match.all)));
@@ -1985,12 +2010,14 @@ async function fitHeroModel(rank, progress) {
   const patchTimes = patches.map(p => p.time);
   const latest = d.time.reduce((m, t) => Math.max(m, t), 0);
   const earliest = d.time.reduce((m, t) => Math.min(m, t), Infinity);
-  // A term for every hero each patch in the sample names in its notes (with a day of games before it).
+  // A term for every hero each patch in the sample touches (with a day of games before it): heroes
+  // its notes name, and heroes who rely on an item it changed. An item change usually moves a hero
+  // less than a change to the hero, so those terms are pulled harder toward no change.
   const terms = [];
   for (const p of patches) {
     if (p.time < earliest + 86400 || p.time > latest) continue;
-    for (const id of patchedHeroes(p, heroList).keys()) {
-      if (d.index.has(id)) terms.push({ time: p.time, hero: d.index.get(id), patch: p.title });
+    for (const [id, touch] of patchTouches(p, heroList, [...assets.byId.values()], tops)) {
+      if (d.index.has(id)) terms.push({ time: p.time, hero: d.index.get(id), patch: p.title, ridge: MODEL_PATCH_RIDGE * (touch.direct ? 1 : 2) });
     }
   }
   attachPatchTerms(d, terms);
@@ -2285,7 +2312,7 @@ function heroTip(id) {
 function patchTip(p) {
   const shown = p.lines.slice(0, 8);
   return el('div', { class: 'tt-patch' },
-    el('p', { class: 'tt-desc' }, el('b', { text: `Changed in the ${p.title} update` }),
+    el('p', { class: 'tt-desc' }, el('b', { text: p.direct ? `Changed in the ${p.title} update` : `An item they rely on changed in the ${p.title} update` }),
       p.change != null ? `. Measured since: ${signedPct(p.change)} to their team’s chance of winning (±${(1.96 * p.changeSe * 100).toFixed(1)}%), already counted in their tier.` : '.'),
     el('ul', {}, shown.map(l => el('li', { text: l })), p.lines.length > shown.length && el('li', { text: `and ${p.lines.length - shown.length} more` })));
 }

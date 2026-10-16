@@ -29,6 +29,7 @@ TOP_BADGE = 100            # Ascendant and up
 KEEP_DAYS = 7
 PATCH_MIN_HOURS = 24       # after a patch, wait this long before using only post-patch games
 EARLY_MIN_GAMES = 200      # ...except heroes the patch changed, who switch once they have this many
+ITEM_RELIANCE = 0.3        # a hero relies on an item their top players buy in this share of games
 WINDOW_SECONDS = 3 * 3600
 SETTLE_SECONDS = 8 * 3600
 REQUEST_GAP_SECONDS = 1.0
@@ -401,11 +402,22 @@ def refresh(root, log=print):
     patch, changes = latest_patch(now)
     # Right after a patch, older games describe the old game; once there's enough, use only new ones.
     since = patch if now - patch >= PATCH_MIN_HOURS * 3600 else 0
-    # Heroes the patch notes name switch sooner: their old games are the least like the new game.
+    # Heroes the patch touches switch sooner: their old games are the least like the new game. That is
+    # the heroes its notes name, and the heroes whose top players rely on an item it changed.
     hero_since = {}
     if patch and not since and changes:
         ids = {name_key(h["name"]): h["id"] for h in fetch_json("/assets/heroes?only_active=true")}
         changed = {ids[name_key(n)] for n in changes if name_key(n) in ids}
+        item_ids = {name_key(v["name"]): i for i, v in items.items() if v.get("name")}
+        changed_items = {item_ids[name_key(n)] for n in changes if name_key(n) in item_ids}
+        if changed_items:
+            played, relied = Counter(), Counter()
+            for g in data["games"]:
+                if g[5]:
+                    played[g[2]] += 1
+                    if changed_items & {i for i, _t, _s in g[5]}:
+                        relied[g[2]] += 1
+            changed |= {h for h in played if relied[h] >= ITEM_RELIANCE * played[h]}
         counts = Counter(g[2] for g in data["games"] if g[1] >= patch and g[5])
         hero_since = {h: patch for h in changed if counts[h] >= EARLY_MIN_GAMES}
     by_hero = defaultdict(list)
